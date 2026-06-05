@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd backend; npm install express cors dotenv ws better-sqlite3 NeteaseCloudMusicApi; npm install -D typescript @types/node @types/express @types/cors @types/ws @types/better-sqlite3 ts-node nodemon$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
