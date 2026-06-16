@@ -48,10 +48,15 @@ pnpm-debug.log*
 coverage/
 
 # Claude code
+.agents/
 .claude/
+
+.workbuddy/
 
 #github skills
 .github/
 
 #document
 文档/
+api-enhanced/*
+user-data/get-playlists/

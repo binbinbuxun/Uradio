@@ -1,9 +1,14 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
+import { LRUCache } from 'lru-cache';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { TtsService } from './tts.service';
 import { MusicService } from '../music/music.service';
 import { LlmService } from '../llm/llm.service';
 import { PlaybackStateService } from '../state/playback-state.service';
 import { SchedulerService } from '../scheduler/scheduler.service';
+import { ChatMessage } from '../chat/chat-message.entity';
+import { ChatGateway } from '../chat/chat.gateway';
 
 export interface PrefetchResult {
   next: {
@@ -54,7 +59,7 @@ export interface CachedSegue {
 export class PrefetchService {
   private readonly logger = new Logger(PrefetchService.name);
   private pendingSegue: CachedSegue | null = null;
-  private genreCache = new Map<string, string[]>();
+  private genreCache = new LRUCache<string, string[]>({ max: 1000 });
   private playCount = 0;
   private nextRecommendationAt: number;
 
@@ -64,6 +69,10 @@ export class PrefetchService {
     private readonly llmService: LlmService,
     private readonly playbackState: PlaybackStateService,
     private readonly schedulerService: SchedulerService,
+    @InjectRepository(ChatMessage)
+    private readonly chatMessageRepo: Repository<ChatMessage>,
+    @Inject(forwardRef(() => ChatGateway))
+    private readonly chatGateway: ChatGateway,
   ) {
     this.nextRecommendationAt = this.randomThreshold();
   }
@@ -122,6 +131,16 @@ export class PrefetchService {
         createdAt: Date.now(),
         type: 'opening',
       };
+
+      // 将开场白写入对话历史
+      this.saveSegueToChatHistory(result.say, 'opening').catch(
+        e => this.logger.warn(`Failed to save opening to chat history: ${e}`),
+      );
+      // 广播开场事件给前端
+      this.chatGateway.broadcastSegue({
+        type: 'opening',
+        text: result.say,
+      });
 
       return opening;
     } catch (error) {
@@ -192,22 +211,35 @@ export class PrefetchService {
           // Search each recommended song
           const recommendedSongs: CachedSegue['recommendedSongs'] = [];
           for (const item of rec.play) {
-            const kw = item.keyword || '';
-            if (!kw || kw.length > 50) continue;
-            try {
-              const result: any = await this.musicService.searchMusic(kw, 1);
-              const song = result?.songs?.[0];
-              if (song) {
-                recommendedSongs.push({
-                  id: song.id.toString(),
-                  name: song.name,
-                  artist: song.ar?.map((a: any) => a.name).join(' / ') || '',
-                  cover: song.al?.picUrl || '',
-                  reason: item.reason || '',
-                });
+            const title = (item as any).title || '';
+            const artist = (item as any).artist || '';
+            const kw = item.keyword || title || '';
+            const queries: string[] = [kw];
+            if (title && artist) queries.push(`${title} ${artist}`);
+            if (title) queries.push(title);
+
+            let found = false;
+            for (const query of queries) {
+              if (found || !query || query.length > 50) continue;
+              try {
+                const result: any = await this.musicService.searchMusic(query, 3);
+                const songs = result?.songs || [];
+                const best = title
+                  ? songs.find((s: any) => s.name?.toLowerCase().includes(title.toLowerCase())) || songs[0]
+                  : songs[0];
+                if (best) {
+                  recommendedSongs.push({
+                    id: best.id.toString(),
+                    name: best.name,
+                    artist: best.ar?.map((a: any) => a.name).join(' / ') || '',
+                    cover: best.al?.picUrl || '',
+                    reason: (item as any).reason || '',
+                  });
+                  found = true;
+                }
+              } catch {
+                // try next query
               }
-            } catch {
-              // skip failed searches
             }
           }
 
@@ -229,6 +261,19 @@ export class PrefetchService {
             type: 'recommendation',
             recommendedSongs: recommendedSongs.length > 0 ? recommendedSongs : undefined,
           };
+
+          // 将串场推荐写入对话历史，让 LLM 上下文能看到
+          this.saveSegueToChatHistory(rec.say, 'recommendation', title, artist, recommendedSongs).catch(
+            e => this.logger.warn(`Failed to save recommendation to chat history: ${e}`),
+          );
+          // 广播串场事件给前端
+          this.chatGateway.broadcastSegue({
+            type: 'recommendation',
+            text: rec.say,
+            songTitle: title,
+            artist,
+            recommendedSongs: recommendedSongs.length > 0 ? recommendedSongs : undefined,
+          });
 
           // Reset counter
           this.playCount = 0;
@@ -305,6 +350,18 @@ export class PrefetchService {
           type: 'segue',
         };
 
+        // 将串场词写入对话历史，让 LLM 上下文能看到
+        this.saveSegueToChatHistory(segueText, 'segue', title, artist).catch(
+          e => this.logger.warn(`Failed to save segue to chat history: ${e}`),
+        );
+        // 广播串场事件给前端
+        this.chatGateway.broadcastSegue({
+          type: 'segue',
+          text: segueText,
+          songTitle: title,
+          artist,
+        });
+
         const audioUrl = `/api/tts?text=${encodeURIComponent(segueText)}&voice=zh-CN-XiaoxiaoNeural`;
         segue = { text: segueText, audioUrl, type: 'segue' };
       }
@@ -331,5 +388,33 @@ export class PrefetchService {
     const segue = this.pendingSegue;
     this.pendingSegue = null;
     return segue;
+  }
+
+  /**
+   * 将串场/推荐事件写入 ChatMessage 表
+   * 这样串场内容进入对话历史，LLM 后续对话能看到自己做了什么串场介绍
+   */
+  private async saveSegueToChatHistory(
+    text: string,
+    segueType: 'opening' | 'segue' | 'recommendation',
+    songTitle?: string,
+    artist?: string,
+    recommendedSongs?: any[],
+  ): Promise<void> {
+    const chatId = `segue_${Date.now()}`;
+    await this.chatMessageRepo.save(
+      this.chatMessageRepo.create({
+        chatId,
+        role: 'dj',
+        content: text,
+        metadata: {
+          segueType,
+          songTitle: songTitle || undefined,
+          artist: artist || undefined,
+          recommendedSongs: recommendedSongs && recommendedSongs.length > 0 ? recommendedSongs : undefined,
+        },
+      }),
+    );
+    this.logger.debug(`Saved ${segueType} to chat history: "${text.substring(0, 30)}..."`);
   }
 }

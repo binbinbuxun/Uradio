@@ -1,5 +1,5 @@
-import React from 'react';
-import { Mic, ArrowUp } from 'lucide-react';
+import React, { useState } from 'react';
+import { ArrowUp, ChevronDown, ChevronUp } from 'lucide-react';
 
 interface ChatPanelProps {
   chatMessages: { id: string; role: 'user' | 'dj'; content: string; timestamp: number; recommendedSongs?: any[]; searchResults?: any[] }[];
@@ -8,13 +8,38 @@ interface ChatPanelProps {
   chatInput: string;
   playlist: any[];
   currentIndex: number;
-  historyLoaded: boolean;
   chatContainerRef: React.RefObject<HTMLDivElement | null>;
   onInputChange: (value: string) => void;
   onSend: () => void;
   onClearHistory: () => void;
   onAddTrack: (track: any) => void;
+  onViewHistory: () => void;
 }
+
+// Song card sub-component
+const SongCard: React.FC<{ song: any; added: boolean; onAddTrack: (song: any) => void }> = React.memo(({ song, added, onAddTrack }) => (
+  <div
+    onClick={() => { if (!added) onAddTrack(song); }}
+    className={`flex items-center gap-md border px-md py-sm rounded-lg transition-colors select-none ${
+      added
+        ? 'border-border opacity-50 cursor-default'
+        : 'border-border-visible cursor-pointer hover:border-text-secondary hover:bg-surface-raised active:scale-[0.99]'
+    }`}
+  >
+    {song.cover && (
+      <img src={song.cover} alt="" loading="lazy" className="w-10 h-10 rounded object-cover flex-shrink-0" />
+    )}
+    <div className="flex flex-col min-w-0 flex-1">
+      <span className="text-body text-text-primary truncate">{song.name}</span>
+      <span className="text-caption text-text-secondary truncate">{song.artist}</span>
+    </div>
+    {added ? (
+      <span className="text-[10px] text-text-disabled flex-shrink-0 font-mono">ADDED</span>
+    ) : (
+      <span className="text-[10px] text-interactive flex-shrink-0 font-mono tracking-widest">PLAY</span>
+    )}
+  </div>
+));
 
 const ChatPanel: React.FC<ChatPanelProps> = React.memo(({
   chatMessages,
@@ -23,202 +48,180 @@ const ChatPanel: React.FC<ChatPanelProps> = React.memo(({
   chatInput,
   playlist,
   currentIndex,
-  historyLoaded,
   chatContainerRef,
   onInputChange,
   onSend,
   onClearHistory,
   onAddTrack,
+  onViewHistory,
 }) => {
+  const [collapsedMsgs, setCollapsedMsgs] = useState<Set<string>>(new Set());
   const isInPlaylist = (songId: string) => playlist.some((t: any) => t.id === songId);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') onSend();
   };
 
+  const toggleCollapse = (msgId: string) => {
+    setCollapsedMsgs(prev => {
+      const next = new Set(prev);
+      if (next.has(msgId)) next.delete(msgId); else next.add(msgId);
+      return next;
+    });
+  };
+
+  const dedupeSongs = (songs: any[]) => {
+    const seen = new Set<string>();
+    return songs.filter(s => { if (seen.has(s.id)) return false; seen.add(s.id); return true; });
+  };
+
   return (
-    <section className="w-full mt-auto mb-2 border border-border-visible bg-surface rounded-xl overflow-hidden relative transition-colors duration-300">
-      <div className="absolute inset-0 dot-grid-subtle opacity-30 pointer-events-none"></div>
+    <section className="w-full mt-auto mb-2 border border-border-visible bg-surface rounded-lg overflow-hidden transition-colors duration-300">
+      <div className="absolute inset-0 dot-grid-subtle opacity-20 pointer-events-none"></div>
 
-      <div className="p-sm flex justify-between items-center border-b border-border-visible z-10 relative bg-surface/50 backdrop-blur-sm">
-        <div className="flex items-center gap-xs">
-          <div className="w-4 h-4 rounded-full border border-success flex items-center justify-center">
-            <div className="w-2 h-2 rounded-full bg-success animate-pulse"></div>
-          </div>
-          <span className="text-subheading text-text-display font-medium tracking-tight">DJ</span>
-        </div>
-        <span className="text-label text-success tracking-widest opacity-80">LIVE DJ</span>
-      </div>
-
-      <div className="p-md z-10 relative flex flex-col gap-md">
-        <div ref={chatContainerRef} className="flex flex-col gap-sm max-h-[300px] overflow-y-auto queue-scrollbar">
-          {historyLoaded && (
-            <div className="flex items-center justify-between px-sm py-xs text-caption text-text-disabled border-b border-border-visible pb-xs mb-xs">
-              <span>Loaded {chatMessages.length} message{chatMessages.length > 1 ? 's' : ''} from history</span>
-              <div className="flex gap-sm">
-                <button
-                  onClick={onClearHistory}
-                  className="text-text-disabled hover:text-text-secondary transition-colors"
-                >
-                  Clear
-                </button>
-              </div>
-            </div>
-          )}
-          {chatMessages.length === 0 && !isDjTyping && (
-            <div className="text-center text-text-disabled text-label py-md">
-              Say something to the DJ...
-            </div>
-          )}
-
-          {chatMessages.map((msg) => (
-            <div key={msg.id}>
-              <div
-                className={`flex gap-sm ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-              >
-                {msg.role === 'dj' && (
-                  <div className="w-8 h-8 rounded-full bg-surface-raised border border-border flex-shrink-0 flex items-center justify-center">
-                    <Mic size={14} className="text-text-secondary" />
-                  </div>
-                )}
-                <div
-                  className={`max-w-[80%] rounded-2xl px-md py-sm ${
-                    msg.role === 'user'
-                      ? 'bg-interactive text-black rounded-br-none'
-                      : 'bg-surface-raised border border-border-visible rounded-bl-none'
-                  }`}
-                >
-                  {msg.role === 'dj' && (
-                    <div className="text-label text-text-secondary mb-1">DJ</div>
-                  )}
-                  <p className={`text-body-sm leading-relaxed ${msg.role === 'user' ? 'text-black' : 'text-text-primary'}`}>
-                    {msg.content}
-                  </p>
-                </div>
-                {msg.role === 'user' && (
-                  <div className="w-8 h-8 rounded-full bg-surface-raised border border-border flex-shrink-0 flex items-center justify-center">
-                    <span className="text-label text-text-primary">U</span>
-                  </div>
-                )}
-              </div>
-
-              {/* Recommended songs */}
-              {msg.role === 'dj' && msg.recommendedSongs && msg.recommendedSongs.length > 0 && (
-                <div className="flex gap-sm mt-1">
-                  <div className="w-8 flex-shrink-0" />
-                  <div className="flex flex-col gap-2 max-w-[80%]">
-                    {msg.recommendedSongs.map((song: any) => {
-                      const added = isInPlaylist(song.id);
-                      return (
-                        <div
-                          key={song.id}
-                          onClick={() => { if (!added) onAddTrack(song); }}
-                          className={`flex items-center gap-md bg-surface border rounded-xl px-md py-sm transition-all active:scale-95 ${
-                            added
-                              ? 'border-success/30 opacity-60 cursor-default'
-                              : 'border-border-visible cursor-pointer hover:border-interactive hover:bg-surface-raised'
-                          }`}
-                        >
-                          {song.cover && (
-                            <img src={song.cover} alt="" loading="lazy" className="w-12 h-12 rounded-lg object-cover flex-shrink-0" />
-                          )}
-                          <div className="flex flex-col min-w-0 flex-1">
-                            <span className="text-body text-text-primary truncate">{song.name}</span>
-                            <span className="text-label-normal text-text-secondary truncate">{song.artist}</span>
-                          </div>
-                          {added && (
-                            <span className="text-[10px] text-success flex-shrink-0">已添加</span>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* Search results */}
-              {msg.role === 'dj' && msg.searchResults && msg.searchResults.length > 0 && (
-                <div className="flex gap-sm mt-1">
-                  <div className="w-8 flex-shrink-0" />
-                  <div className="flex flex-col gap-2 max-w-[80%]">
-                    <div className="text-label text-text-secondary">选择一首播放</div>
-                    {msg.searchResults.map((song: any) => {
-                      const added = isInPlaylist(song.id);
-                      return (
-                        <div
-                          key={song.id}
-                          onClick={() => { if (!added) onAddTrack(song); }}
-                          className={`flex items-center gap-md bg-surface border rounded-xl px-md py-sm transition-all active:scale-95 ${
-                            added
-                              ? 'border-success/30 opacity-60 cursor-default'
-                              : 'border-border-visible cursor-pointer hover:border-interactive hover:bg-surface-raised'
-                          }`}
-                        >
-                          {song.cover && (
-                            <img src={song.cover} alt="" loading="lazy" className="w-12 h-12 rounded-lg object-cover flex-shrink-0" />
-                          )}
-                          <div className="flex flex-col min-w-0 flex-1">
-                            <span className="text-body text-text-primary truncate">{song.name}</span>
-                            <span className="text-label-normal text-text-secondary truncate">{song.artist}</span>
-                          </div>
-                          {added ? (
-                            <span className="text-[10px] text-success flex-shrink-0">已添加</span>
-                          ) : (
-                            <span className="text-label text-interactive flex-shrink-0">播放</span>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
-          ))}
-
-          {/* DJ Typing Indicator */}
-          {isDjTyping && !djStreamIdRef.current && (
-            <div className="flex gap-sm justify-start">
-              <div className="w-8 h-8 rounded-full bg-surface-raised border border-border flex-shrink-0 flex items-center justify-center">
-                <Mic size={14} className="text-text-secondary" />
-              </div>
-              <div className="bg-surface-raised border border-border-visible rounded-2xl rounded-bl-none px-md py-sm">
-                <div className="text-label text-text-secondary mb-1">DJ</div>
-                <div className="flex gap-1 items-center py-1">
-                  <div className="w-1.5 h-1.5 rounded-full bg-text-secondary animate-bounce" style={{ animationDelay: '0ms' }} />
-                  <div className="w-1.5 h-1.5 rounded-full bg-text-secondary animate-bounce" style={{ animationDelay: '150ms' }} />
-                  <div className="w-1.5 h-1.5 rounded-full bg-text-secondary animate-bounce" style={{ animationDelay: '300ms' }} />
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="flex gap-sm mt-md items-center w-full">
-          <div className="flex-1 bg-black border border-border-visible rounded-full px-lg py-sm flex items-center focus-within:border-interactive transition-colors">
-            <input
-              type="text"
-              placeholder="Say something to the DJ..."
-              className="bg-transparent border-none outline-none w-full text-text-primary placeholder-text-disabled text-body-sm"
-              value={chatInput}
-              onChange={(e) => onInputChange(e.target.value)}
-              onKeyDown={handleKeyDown}
-            />
-          </div>
-
-          <button className="w-10 h-10 rounded-full border border-border-visible flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-raised transition-all cursor-pointer active:scale-95 flex-shrink-0 group">
-            <Mic size={18} strokeWidth={1.5} className="group-hover:scale-110 transition-transform" />
+      {/* Header */}
+      <div className="px-md py-sm flex justify-between items-center border-b border-border-visible z-10 relative">
+        <span className="text-label text-text-disabled tracking-widest select-none">Private DJ</span>
+        <div className="flex items-center gap-sm">
+          <button
+            onClick={onViewHistory}
+            className="text-caption text-text-disabled hover:text-text-secondary transition-colors flex items-center"
+            title="查看历史"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="10" />
+              <polyline points="12 6 12 12 16 14" />
+            </svg>
           </button>
           <button
-            onClick={onSend}
-            className={`w-10 h-10 rounded-full border flex items-center justify-center transition-all cursor-pointer active:scale-95 flex-shrink-0 ${
-              chatInput.trim()
-                ? 'border-interactive bg-interactive text-black hover:opacity-90'
-                : 'border-border-visible text-text-disabled bg-surface-raised cursor-not-allowed'
-            }`}
+            onClick={() => {
+              if (window.confirm('确定清空所有对话记录？此操作不可撤销。')) {
+                onClearHistory();
+              }
+            }}
+            className="text-caption text-text-disabled hover:text-text-secondary transition-colors flex items-center"
+            title="新对话"
           >
-            <ArrowUp size={18} strokeWidth={2} />
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
           </button>
         </div>
+      </div>
+
+      {/* Messages */}
+      <div ref={chatContainerRef} className="px-md py-sm z-10 relative flex flex-col max-h-[300px] overflow-y-auto queue-scrollbar font-mono text-body-sm leading-relaxed">
+        {chatMessages.length === 0 && !isDjTyping && (
+          <div className="text-text-disabled py-lg text-center select-none">
+            <span className="text-label tracking-widest">
+              Say something to the DJ
+            </span>
+          </div>
+        )}
+
+        {chatMessages.map((msg) => {
+          const allSongs = dedupeSongs([...(msg.recommendedSongs || []), ...(msg.searchResults || [])]);
+          const hasSongs = msg.role === 'dj' && allSongs.length > 0;
+          const collapsed = collapsedMsgs.has(msg.id);
+          const canCollapse = allSongs.length > 4;
+
+          return (
+            <div key={msg.id} className="group">
+              {/* Message line — both roles use same indent structure */}
+              <div className="py-1 flex">
+                <span className="text-label text-text-disabled mr-md select-none shrink-0 w-[28px] text-right">
+                  {msg.role === 'dj' ? 'DJ' : 'YOU'}
+                </span>
+                <span className={msg.role === 'user' ? 'text-text-secondary' : 'text-text-primary'}>
+                  {msg.content}
+                  {msg.role === 'dj' && msg.id === djStreamIdRef.current && (
+                    <span className="inline-block w-[6px] h-[13px] bg-text-primary ml-[2px] align-middle animate-[cursor-blink_1s_step-end_infinite]" />
+                  )}
+                </span>
+              </div>
+
+              {/* TTS failed */}
+              {(msg as any).ttsFailed && (
+                <div className="text-caption text-text-disabled pb-1 flex">
+                  <span className="text-label text-text-disabled mr-md select-none shrink-0 w-[28px]">&nbsp;</span>
+                  TTS unavailable
+                </div>
+              )}
+
+              {/* Song cards */}
+              {hasSongs && (
+                <div className="ml-0 mb-sm mt-1 flex flex-col gap-1">
+                  {msg.searchResults && msg.searchResults.length > 0 && (
+                    <div className="text-[10px] text-text-disabled tracking-widest mb-1 pl-[28px]">RESULTS</div>
+                  )}
+                  {/* Song cards: show all if ≤4, otherwise first 3 + collapsible */}
+                  {canCollapse ? (
+                    <>
+                      {allSongs.slice(0, 3).map((song: any) => (
+                        <SongCard key={song.id} song={song} added={isInPlaylist(song.id)} onAddTrack={onAddTrack} />
+                      ))}
+                      <div
+                        className={`overflow-hidden transition-all duration-300 ease-out flex flex-col gap-1 ${
+                          collapsed ? 'max-h-0 opacity-0' : 'max-h-[500px] opacity-100'
+                        }`}
+                      >
+                        {allSongs.slice(3).map((song: any) => (
+                          <SongCard key={song.id} song={song} added={isInPlaylist(song.id)} onAddTrack={onAddTrack} />
+                        ))}
+                      </div>
+                      <button
+                        onClick={() => toggleCollapse(msg.id)}
+                        className="text-caption text-text-disabled hover:text-text-secondary transition-colors self-start flex items-center gap-1"
+                      >
+                        {collapsed ? (
+                          <><ChevronDown size={10} /> Show {allSongs.length - 3} more</>
+                        ) : (
+                          <><ChevronUp size={10} /> Show less</>
+                        )}
+                      </button>
+                    </>
+                  ) : (
+                    allSongs.map((song: any) => (
+                      <SongCard key={song.id} song={song} added={isInPlaylist(song.id)} onAddTrack={onAddTrack} />
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {/* Typing */}
+        {isDjTyping && !djStreamIdRef.current && (
+          <div className="py-1 flex">
+            <span className="text-label text-text-disabled mr-md select-none shrink-0 w-[28px] text-right">DJ</span>
+            <span className="inline-block w-[6px] h-[13px] bg-text-disabled align-middle animate-[cursor-blink_1s_step-end_infinite]" />
+          </div>
+        )}
+      </div>
+
+      {/* Input bar */}
+      <div className="px-md py-sm border-t border-border-visible z-10 relative flex gap-sm items-center">
+        <span className="text-label text-text-disabled tracking-widest select-none shrink-0">&gt;</span>
+        <input
+          type="text"
+          placeholder="Type a message..."
+          className="bg-transparent border-none outline-none w-full text-text-primary placeholder-text-disabled text-body-sm font-mono"
+          value={chatInput}
+          onChange={(e) => onInputChange(e.target.value)}
+          onKeyDown={handleKeyDown}
+        />
+        <button
+          onClick={onSend}
+          disabled={!chatInput.trim()}
+          className={`shrink-0 w-8 h-8 border flex items-center justify-center transition-all ${
+            chatInput.trim()
+              ? 'border-interactive text-interactive shadow-[0_0_12px_-4px_var(--interactive)] hover:opacity-90 cursor-pointer active:scale-90'
+              : 'border-border-visible text-text-disabled cursor-not-allowed'
+          }`}
+        >
+          <ArrowUp size={14} strokeWidth={2} />
+        </button>
       </div>
     </section>
   );

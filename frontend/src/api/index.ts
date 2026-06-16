@@ -10,20 +10,35 @@ export interface ChatMessage {
   role: 'user' | 'dj';
   content: string;
   timestamp: number;
+  sessionId?: number | null;
+}
+
+export interface ChatSession {
+  id: number;
+  title: string;
+  messageCount: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export const api = {
-  postChat: async (message: string, volume?: number): Promise<{ status: string; chatId?: string }> => {
+  postChat: async (message: string, volume?: number, sessionId?: number | null): Promise<{ status: string; chatId?: string; sessionId?: number; message?: string }> => {
     try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      const body: any = { message, volume, timestamp: Date.now() };
+      if (sessionId) body.sessionId = String(sessionId);
       const res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message, volume, timestamp: Date.now() }),
+        body: JSON.stringify(body),
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
       return res.json();
-    } catch (error) {
+    } catch (error: any) {
       console.error('Chat request failed:', error);
-      return { status: 'error' };
+      return { status: 'error', message: error?.name === 'AbortError' ? '请求超时' : '网络错误' };
     }
   },
 
@@ -91,13 +106,63 @@ export const api = {
     }
   },
 
-  getChatHistory: async (limit = 50): Promise<any[]> => {
+  getChatHistory: async (limit = 50, sessionId?: number | null): Promise<any[]> => {
     try {
-      const res = await fetch(`${API_BASE}/api/chat/history?limit=${limit}`);
+      let url = `${API_BASE}/api/chat/history?limit=${limit}`;
+      if (sessionId) url += `&sessionId=${sessionId}`;
+      const res = await fetch(url);
       return res.json();
     } catch (error) {
       console.error('Get chat history failed:', error);
       return [];
+    }
+  },
+
+  // ─── 会话管理 ────────────────────────────────
+
+  getSessions: async (): Promise<{ status: string; sessions: ChatSession[] }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/chat/sessions`);
+      return res.json();
+    } catch (error) {
+      console.error('Get sessions failed:', error);
+      return { status: 'error', sessions: [] };
+    }
+  },
+
+  createSession: async (title?: string): Promise<{ status: string; session?: ChatSession }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/chat/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+      return res.json();
+    } catch (error) {
+      console.error('Create session failed:', error);
+      return { status: 'error' };
+    }
+  },
+
+  getSessionMessages: async (sessionId: number): Promise<{ status: string; session?: ChatSession; messages?: any[] }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/chat/sessions/${sessionId}/messages`);
+      return res.json();
+    } catch (error) {
+      console.error('Get session messages failed:', error);
+      return { status: 'error' };
+    }
+  },
+
+  deleteSession: async (sessionId: number): Promise<{ status: string }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/chat/sessions/${sessionId}`, {
+        method: 'DELETE',
+      });
+      return res.json();
+    } catch (error) {
+      console.error('Delete session failed:', error);
+      return { status: 'error' };
     }
   },
 
@@ -143,11 +208,12 @@ export const api = {
 let socket: Socket | null = null;
 let messageHandler: ((msg: any) => void) | null = null;
 
-export const connectStream = (onMessage: (msg: any) => void): Socket | null => {
+export const connectStream = (onMessage: (msg: any) => void, onStatus?: (connected: boolean) => void): Socket | null => {
   // 只保留最新的监听器
   messageHandler = onMessage;
 
   if (socket?.connected) {
+    onStatus?.(true);
     return socket;
   }
 
@@ -161,17 +227,19 @@ export const connectStream = (onMessage: (msg: any) => void): Socket | null => {
 
   socket.on('connect', () => {
     console.log('Socket.IO connected');
+    onStatus?.(true);
   });
 
   socket.on('disconnect', () => {
     console.log('Socket.IO disconnected');
+    onStatus?.(false);
   });
 
-  // 监听所有信令事件，统一转发给单一处理器
+  // 监听所有信令事件，二进制数据通过额外参数传递
   const events = ['now-playing', 'control', 'chat-stream', 'chat-end', 'playlist-update'];
   events.forEach((event) => {
-    socket?.on(event, (data) => {
-      messageHandler?.({ type: event, data });
+    socket?.on(event, (data: any, binary: ArrayBuffer | undefined) => {
+      messageHandler?.({ type: event, data, binary });
     });
   });
 

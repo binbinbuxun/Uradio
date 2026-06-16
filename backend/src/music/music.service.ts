@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { LRUCache } from 'lru-cache';
 import { StateService } from '../state/state.service';
 import { UserService } from '../user/user.service';
 import {
@@ -15,11 +16,9 @@ import type { SoundQualityType } from '@neteasecloudmusicapienhanced/api';
 @Injectable()
 export class MusicService {
   private readonly logger = new Logger(MusicService.name);
-  private searchCache = new Map<string, { data: any; ts: number }>();
-  private urlCache = new Map<string, { data: any; ts: number }>();
+  private searchCache = new LRUCache<string, any>({ max: 500, ttl: 5 * 60 * 1000, ttlAutopurge: true });
+  private urlCache = new LRUCache<string, any>({ max: 300, ttl: 10 * 60 * 1000, ttlAutopurge: true });
   private dailyRecCache: { data: any; ts: number } | null = null;
-  private readonly SEARCH_CACHE_TTL = 5 * 60 * 1000; // 搜索缓存 5分钟
-  private readonly URL_CACHE_TTL = 10 * 60 * 1000;   // URL缓存 10分钟（链接有效期约20分钟）
   private readonly DAILY_REC_TTL = 30 * 60 * 1000;   // 日推缓存 30分钟
 
   constructor(
@@ -28,19 +27,19 @@ export class MusicService {
     private readonly userService: UserService,
   ) {}
 
-  // 1. 歌曲检索（带缓存）
+  // 1. 歌曲检索（带 LRU 缓存）
   async searchMusic(keyword: string, limit = 10, offset = 0) {
     const cacheKey = `${keyword}_${limit}_${offset}`;
     const cached = this.searchCache.get(cacheKey);
-    if (cached && Date.now() - cached.ts < this.SEARCH_CACHE_TTL) {
+    if (cached) {
       this.logger.debug(`Search cache hit: ${keyword}`);
-      return cached.data;
+      return cached;
     }
 
     try {
       const res = await cloudsearch({ keywords: keyword, limit, offset, type: 1 });
       if (res.status === 200) {
-        this.searchCache.set(cacheKey, { data: res.body.result, ts: Date.now() });
+        this.searchCache.set(cacheKey, res.body.result);
         return res.body.result;
       }
       throw new Error('Search failed');
@@ -50,20 +49,30 @@ export class MusicService {
     }
   }
 
-  // 2. 获取播放直链（带缓存，携带登录态 cookie）
+  // 2. 获取播放直链（带 LRU 缓存，携带登录态 cookie）
   async getSongUrl(id: string | number) {
     const cacheKey = id.toString();
     const cached = this.urlCache.get(cacheKey);
-    if (cached && Date.now() - cached.ts < this.URL_CACHE_TTL) {
+    if (cached) {
       this.logger.debug(`URL cache hit: ${id}`);
-      return cached.data;
+      return cached;
     }
+    return this.fetchSongUrl(id, cacheKey);
+  }
 
+  // 强制刷新播放直链（链接 403 时调用）
+  async refreshSongUrl(id: string | number) {
+    this.urlCache.delete(id.toString());
+    this.logger.debug(`URL cache invalidated for ${id}, re-fetching`);
+    return this.fetchSongUrl(id, id.toString());
+  }
+
+  private async fetchSongUrl(id: string | number, cacheKey: string) {
     try {
       const cookie = this.stateService.getCookie() || this.configService.get<string>('NETEASE_COOKIE') || '';
       const res = await song_url_v1({ id: id.toString(), level: 'exhigh' as SoundQualityType, cookie });
       if (res.status === 200) {
-        this.urlCache.set(cacheKey, { data: res.body.data, ts: Date.now() });
+        this.urlCache.set(cacheKey, res.body.data);
         return res.body.data;
       }
       throw new Error('Get song url failed');

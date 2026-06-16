@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX } from 'lucide-react';
 import { formatTime } from '../utils';
 
@@ -39,19 +39,6 @@ const PlayerSection: React.FC<PlayerSectionProps> = React.memo(({
   const [isVolumeDragging, setIsVolumeDragging] = useState(false);
   const prevVolumeRef = useRef(0.3);
 
-  useEffect(() => {
-    if (!isVolumeOpen) return;
-    const handleClick = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      if (!target.closest('[data-volume-panel]')) {
-        setIsVolumeOpen(false);
-        setIsVolumeDragging(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [isVolumeOpen]);
-
   const progressPct = audioProgress.duration > 0 ? (audioProgress.current / audioProgress.duration) * 100 : 0;
 
   return (
@@ -88,9 +75,10 @@ const PlayerSection: React.FC<PlayerSectionProps> = React.memo(({
         </div>
 
         <div className="flex items-center gap-sm">
-          <button onClick={onPrev} className="p-sm rounded-full border border-border-visible text-text-secondary hover:text-text-primary hover:border-text-primary transition-all cursor-pointer active:scale-95 hover:-translate-x-0.5"><SkipBack size={16} strokeWidth={1.5} /></button>
+          <button onClick={onPrev} title="上一首" className="p-sm rounded-full border border-border-visible text-text-secondary hover:text-text-primary hover:border-text-primary transition-all cursor-pointer active:scale-95 hover:-translate-x-0.5"><SkipBack size={16} strokeWidth={1.5} /></button>
           <button
             onClick={onPlayPause}
+            title={isPlaying ? '暂停' : '播放'}
             className={`p-sm rounded-full border transition-all duration-300 cursor-pointer text-center flex justify-center items-center ${
               isPlaying
                 ? 'border-interactive text-interactive shadow-[0_0_12px_-4px_var(--interactive)]'
@@ -101,7 +89,7 @@ const PlayerSection: React.FC<PlayerSectionProps> = React.memo(({
               {isPlaying ? <Pause size={16} strokeWidth={1.5} /> : <Play size={16} strokeWidth={1.5} className="ml-0.5" />}
             </span>
           </button>
-          <button onClick={onNext} className="p-sm rounded-full border border-border-visible text-text-secondary hover:text-text-primary hover:border-text-primary transition-all cursor-pointer active:scale-95 hover:translate-x-0.5"><SkipForward size={16} strokeWidth={1.5} /></button>
+          <button onClick={onNext} title="下一首" className="p-sm rounded-full border border-border-visible text-text-secondary hover:text-text-primary hover:border-text-primary transition-all cursor-pointer active:scale-95 hover:translate-x-0.5"><SkipForward size={16} strokeWidth={1.5} /></button>
           <button
             onClick={onRadioModeToggle}
             className={`p-sm rounded-full border transition-all cursor-pointer active:scale-95 text-label ${
@@ -113,17 +101,26 @@ const PlayerSection: React.FC<PlayerSectionProps> = React.memo(({
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="4"/><path d="M4.93 4.93a10 10 0 0 1 14.14 14.14"/><path d="M2 12a10 10 0 0 1 20 0"/></svg>
           </button>
-          <div className="relative ml-2" data-volume-panel>
+          <div className="relative ml-2">
             <button
               onClick={() => setIsVolumeOpen((prev) => !prev)}
+              title="音量"
               className="flex items-center gap-xs text-text-secondary hover:text-text-primary transition-colors cursor-pointer group px-sm py-[6px] rounded-full border border-border-visible hover:border-text-primary active:scale-95"
             >
               <span className="text-label">VOL</span>
               <Volume2 size={16} strokeWidth={1.5} className="group-hover:scale-110 transition-transform" />
             </button>
 
-            <div className={`absolute right-0 bottom-full mb-2 transition-all duration-200 ease-out ${isVolumeOpen ? 'opacity-100 translate-y-0 pointer-events-auto' : 'opacity-0 translate-y-1 pointer-events-none'}`}>
-              <div className="flex flex-col items-center gap-2.5 px-2.5 py-2.5 rounded-xl border border-border-visible bg-surface-raised backdrop-blur-sm shadow-xl z-20">
+            {/* 透明遮挡层 — 点击面板外区域关闭 */}
+            {isVolumeOpen && (
+              <div
+                className="fixed inset-0 z-10"
+                onClick={() => { setIsVolumeOpen(false); setIsVolumeDragging(false); }}
+              />
+            )}
+
+            <div className={`absolute right-0 bottom-full mb-2 transition-all duration-200 ease-out z-20 ${isVolumeOpen ? 'opacity-100 translate-y-0 pointer-events-auto' : 'opacity-0 translate-y-1 pointer-events-none'}`}>
+              <div className="flex flex-col items-center gap-2.5 px-2.5 py-2.5 rounded-xl border border-border-visible bg-surface-raised backdrop-blur-sm shadow-xl">
                 <div className="relative flex items-center justify-center h-28 w-4">
                   <input
                     type="range" min="0" max="1" step="0.01" value={volume}

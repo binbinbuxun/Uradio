@@ -215,16 +215,32 @@ export class AppController {
     @Headers('range') range: string | undefined,
     @Res() res: Response,
   ) {
-    const urls: any = await this.musicService.getSongUrl(id);
-    const songUrl = Array.isArray(urls) ? urls.find((item: any) => item?.url)?.url : urls?.[0]?.url;
+    let urls: any = await this.musicService.getSongUrl(id);
+    let songUrl = Array.isArray(urls) ? urls.find((item: any) => item?.url)?.url : urls?.[0]?.url;
 
     if (!songUrl) {
       return res.status(404).json({ error: 'Audio source not found' });
     }
 
-    const response = await fetch(songUrl, {
+    let response = await fetch(songUrl, {
       headers: range ? { Range: range } : undefined,
     });
+
+    // 链接过期（403/404）→ 刷新缓存重试一次
+    if ((response.status === 403 || response.status === 404) && !response.ok) {
+      console.log(`Audio URL expired for ${id}, refreshing and retrying...`);
+      try {
+        urls = await this.musicService.refreshSongUrl(id);
+        songUrl = Array.isArray(urls) ? urls.find((item: any) => item?.url)?.url : urls?.[0]?.url;
+        if (songUrl) {
+          response = await fetch(songUrl, {
+            headers: range ? { Range: range } : undefined,
+          });
+        }
+      } catch {
+        // retry failed, use original response
+      }
+    }
 
     if (!response.ok || !response.body) {
       return res.status(response.status).json({ error: 'Failed to fetch audio source' });

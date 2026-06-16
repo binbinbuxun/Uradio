@@ -78,15 +78,26 @@ const ClockSection: React.FC<ClockSectionProps> = React.memo(({
           {hours}:{minutes}
         </div>
         <div className="flex-1 flex flex-col items-center justify-center gap-sm px-xl">
-          <div key={'prev-' + currentLyricIndex} className="text-[20px] text-text-secondary opacity-50 text-center leading-tight animate-lyric-swap">
-            {currentLyricIndex > 0 && lyricLines[currentLyricIndex - 1] ? lyricLines[currentLyricIndex - 1].text : ' '}
-          </div>
-          <div key={'current-' + currentLyricIndex} className="text-[24px] font-body text-text-display font-medium text-center leading-tight animate-lyric-swap">
-            {currentLyricIndex >= 0 && lyricLines[currentLyricIndex] ? lyricLines[currentLyricIndex].text : ' '}
-          </div>
-          <div key={'next-' + currentLyricIndex} className="text-[20px] text-text-secondary opacity-50 text-center leading-tight animate-lyric-swap">
-            {currentLyricIndex >= 0 && currentLyricIndex < lyricLines.length - 1 && lyricLines[currentLyricIndex + 1] ? lyricLines[currentLyricIndex + 1].text : ' '}
-          </div>
+          {lyricLines.length > 0 ? (
+            <>
+              <div key={'prev-' + currentLyricIndex} className="text-[20px] text-text-secondary opacity-50 text-center leading-tight animate-lyric-swap">
+                {currentLyricIndex > 0 && lyricLines[currentLyricIndex - 1] ? lyricLines[currentLyricIndex - 1].text : ' '}
+              </div>
+              <div key={'current-' + currentLyricIndex} className="text-[24px] font-body text-text-display font-medium text-center leading-tight animate-lyric-swap">
+                {currentLyricIndex >= 0 && lyricLines[currentLyricIndex] ? lyricLines[currentLyricIndex].text : ' '}
+              </div>
+              <div key={'next-' + currentLyricIndex} className="text-[20px] text-text-secondary opacity-50 text-center leading-tight animate-lyric-swap">
+                {currentLyricIndex >= 0 && currentLyricIndex < lyricLines.length - 1 && lyricLines[currentLyricIndex + 1] ? lyricLines[currentLyricIndex + 1].text : ' '}
+              </div>
+            </>
+          ) : (
+            <div className="flex flex-col items-center gap-sm">
+              <div className="w-8 h-8 rounded-full border border-border-visible flex items-center justify-center">
+                <span className="text-caption text-text-disabled">♪</span>
+              </div>
+              <span className="text-label text-text-disabled tracking-widest">No lyrics available</span>
+            </div>
+          )}
         </div>
       </div>
     </section>

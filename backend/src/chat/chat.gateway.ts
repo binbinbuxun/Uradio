@@ -20,6 +20,8 @@ export enum WsMessageType {
   PLAYLIST_UPDATE = 'playlist-update',
   PLAYBACK_CMD = 'playback-cmd',
   CHAT_SEND = 'chat-send',
+  SEGUE = 'segue',           // 串场事件 (segue / recommendation / opening)
+  TRACE = 'execution-trace',  // 执行轨迹
   PING = 'ping',
   PONG = 'pong',
 }
@@ -155,6 +157,20 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.broadcast(WsMessageType.CHAT_STREAM, data);
   }
 
+  broadcastTtsChunk(chatId: string, sentenceIndex: number, sentenceCount: number, audioBuffer: Buffer) {
+    // Socket.IO 原生二进制传输 — Buffer 作为第二参数，避免 base64 膨胀
+    this.server.emit(WsMessageType.CHAT_STREAM, {
+      type: WsMessageType.CHAT_STREAM,
+      ts: Date.now(),
+      data: {
+        role: 'dj' as const,
+        delta: '',
+        done: false,
+        metadata: { chatId, sentenceIndex, sentenceCount, ttsBinary: true },
+      },
+    }, audioBuffer);
+  }
+
   broadcastChatEnd(data: { id: string; usage?: any }) {
     this.broadcast(WsMessageType.CHAT_END, data);
   }
@@ -170,6 +186,28 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     playlist?: any[];
   }) {
     this.broadcast(WsMessageType.PLAYLIST_UPDATE, data);
+  }
+
+  broadcastSegue(data: {
+    type: 'opening' | 'segue' | 'recommendation';
+    text: string;
+    songTitle?: string;
+    artist?: string;
+    recommendedSongs?: any[];
+    chatId?: string;
+  }) {
+    this.broadcast(WsMessageType.SEGUE, data);
+  }
+
+  broadcastTrace(data: {
+    chatId: string;
+    step: string;
+    input?: any;
+    output?: any;
+    durationMs?: number;
+    status?: 'ok' | 'error';
+  }) {
+    this.broadcast(WsMessageType.TRACE, data);
   }
 
   // === 私有方法 ===
