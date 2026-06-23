@@ -4,6 +4,7 @@ import { ConfigModule } from '@nestjs/config';
 import { TtsService } from './tts.service';
 import { TtsController } from './tts.controller';
 import { PrefetchService } from './prefetch.service';
+import { SegueEngineService } from './segue-engine.service';
 import { MusicModule } from '../music/music.module';
 import { LlmModule } from '../llm/llm.module';
 import { StateModule } from '../state/state.module';
@@ -22,7 +23,9 @@ import { ChatMessage } from '../chat/chat-message.entity';
     forwardRef(() => ChatModule),  // forwardRef 避免循环依赖
   ],
   controllers: [TtsController],
-  providers: [TtsService, PrefetchService],
-  exports: [TtsService, PrefetchService],
+  providers: [TtsService, SegueEngineService, PrefetchService],
+  exports: [TtsService, SegueEngineService, PrefetchService],
 })
 export class TtsModule {}
+
+

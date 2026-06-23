@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Uradio 前端 API 契约定义
  */
 import { io, Socket } from 'socket.io-client';
@@ -11,6 +11,7 @@ export interface ChatMessage {
   content: string;
   timestamp: number;
   sessionId?: number | null;
+  source?: 'chat' | 'radio_auto';
 }
 
 export interface ChatSession {
@@ -19,6 +20,13 @@ export interface ChatSession {
   messageCount: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface QueueState {
+  playlist: { id: string; name: string; artist: string; cover?: string; url: string }[];
+  currentIndex: number;
+  action: string;
+  currentTrackId?: string | null;
 }
 
 export const api = {
@@ -52,7 +60,7 @@ export const api = {
     }
   },
 
-  postControl: async (command: string, payload?: any): Promise<{ status: string }> => {
+  postControl: async (command: string, payload?: any): Promise<{ status: string; queue?: QueueState }> => {
     try {
       const res = await fetch(`${API_BASE}/api/control`, {
         method: 'POST',
@@ -66,10 +74,56 @@ export const api = {
     }
   },
 
+  getQueue: async (): Promise<QueueState> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/queue`);
+      return res.json();
+    } catch (error) {
+      console.error('Get queue failed:', error);
+      return { playlist: [], currentIndex: 0, action: 'pause', currentTrackId: null };
+    }
+  },
+
+  addQueueTrack: async (
+    payload: {
+      track?: any;
+      tracks?: any[];
+      insertAt?: number;
+      playNow?: boolean;
+      source?: 'manual' | 'chat' | 'radio_auto';
+    },
+  ): Promise<{ status: string; queue?: QueueState; message?: string }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/queue/add`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      return res.json();
+    } catch (error) {
+      console.error('Add queue track failed:', error);
+      return { status: 'error', message: '网络错误' };
+    }
+  },
+
+  selectQueueTrack: async (index: number): Promise<{ status: string; queue?: QueueState; message?: string }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/queue/select`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ index }),
+      });
+      return res.json();
+    } catch (error) {
+      console.error('Select queue track failed:', error);
+      return { status: 'error', message: '网络错误' };
+    }
+  },
+
   getPlaylist: async () => {
     try {
-      const res = await fetch(`${API_BASE}/playlist`);
-      return res.json();
+      const queue = await api.getQueue();
+      return queue.playlist;
     } catch (error) {
       console.error('Get playlist failed:', error);
       return [];
@@ -117,8 +171,6 @@ export const api = {
       return [];
     }
   },
-
-  // ─── 会话管理 ────────────────────────────────
 
   getSessions: async (): Promise<{ status: string; sessions: ChatSession[] }> => {
     try {
@@ -204,12 +256,10 @@ export const api = {
   },
 };
 
-// Socket.IO 连接（单例）
 let socket: Socket | null = null;
 let messageHandler: ((msg: any) => void) | null = null;
 
 export const connectStream = (onMessage: (msg: any) => void, onStatus?: (connected: boolean) => void): Socket | null => {
-  // 只保留最新的监听器
   messageHandler = onMessage;
 
   if (socket?.connected) {
@@ -235,8 +285,7 @@ export const connectStream = (onMessage: (msg: any) => void, onStatus?: (connect
     onStatus?.(false);
   });
 
-  // 监听所有信令事件，二进制数据通过额外参数传递
-  const events = ['now-playing', 'control', 'chat-stream', 'chat-end', 'playlist-update'];
+  const events = ['now-playing', 'control', 'chat-stream', 'chat-end', 'playlist-update', 'segue'];
   events.forEach((event) => {
     socket?.on(event, (data: any, binary: ArrayBuffer | undefined) => {
       messageHandler?.({ type: event, data, binary });

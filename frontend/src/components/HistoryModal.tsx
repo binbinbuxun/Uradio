@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+﻿import React, { useState, useEffect } from 'react';
 import { X, MessageSquare, Trash2 } from 'lucide-react';
 import { api } from '../api';
 import type { ChatSession } from '../api';
@@ -13,7 +13,7 @@ interface HistoryModalProps {
 const HistoryModal: React.FC<HistoryModalProps> = ({ isOpen, onClose, onLoadSession, currentSessionId }) => {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [loading, setLoading] = useState(false);
-  const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [_deletingId, setDeletingId] = useState<number | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -115,3 +115,6 @@ const HistoryModal: React.FC<HistoryModalProps> = ({ isOpen, onClose, onLoadSess
 };
 
 export default HistoryModal;
+
+
+

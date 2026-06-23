@@ -31,6 +31,7 @@ export class TtsService {
   private readonly subscriptionKey: string;
   private readonly region: string;
   readonly defaultVoice: string;
+  readonly defaultStyle: string;
   // Redis 缓存替代内存 Map，重启不丢失
   private readonly CACHE_TTL = 7 * 24 * 3600; // 7 天过期
   private readonly CACHE_PREFIX = 'tts:';
@@ -44,6 +45,7 @@ export class TtsService {
     this.subscriptionKey = this.config.get<string>('AZURE_SPEECH_KEY') || '';
     this.region = this.config.get<string>('AZURE_SPEECH_REGION') || 'eastasia';
     this.defaultVoice = this.config.get<string>('AZURE_TTS_VOICE') || 'zh-CN-XiaoxiaoNeural';
+    this.defaultStyle = this.config.get<string>('AZURE_TTS_STYLE') || '';
   }
 
   private get ttsEndpoint() {
@@ -71,7 +73,7 @@ export class TtsService {
       rate: options.rate || '0%',
       pitch: options.pitch || '0Hz',
       volume: options.volume || '0%',
-      style: options.style,
+      style: options.style || this.defaultStyle,
     });
     return createHash('md5').update(raw).digest('hex');
   }
@@ -118,8 +120,8 @@ export class TtsService {
       ? `<prosody ${prosodyParts.join(' ')}>${this.escapeXml(options.text)}</prosody>`
       : this.escapeXml(options.text);
 
-    const styleTag = options.style
-      ? `<mstts:express-as style="${options.style}">${prosodyTag}</mstts:express-as>`
+    const styleTag = (options.style || this.defaultStyle)
+      ? `<mstts:express-as style="${options.style || this.defaultStyle}">${prosodyTag}</mstts:express-as>`
       : prosodyTag;
 
     return `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts='https://www.w3.org/2001/mstts' xml:lang='zh-CN'><voice name='${voice}'>${styleTag}</voice></speak>`;

@@ -1,8 +1,8 @@
-import { Controller, Get, Post, Body, Headers, Param, Res, Query, HttpCode, HttpStatus } from '@nestjs/common';
+﻿import { Controller, Get, Post, Body, Headers, Param, Res, Query, HttpCode, HttpStatus } from '@nestjs/common';
 import { AppService } from './app.service';
 import { MusicService } from './music/music.service';
 import { StateService } from './state/state.service';
-import { PlaybackStateService } from './state/playback-state.service';
+import { PlaybackStateService, PlaybackContent } from './state/playback-state.service';
 import { ChatGateway } from './chat/chat.gateway';
 import { TasteService } from './user/taste.service';
 import type { Response } from 'express';
@@ -17,6 +17,70 @@ export class AppController {
     private readonly chatGateway: ChatGateway,
     private readonly tasteService: TasteService,
   ) {}
+
+  private toQueueItem(track: PlaybackContent) {
+    return {
+      id: track.id,
+      name: track.title,
+      artist: track.artist || '',
+      cover: track.coverUrl || '',
+      url: track.url || `/audio/${track.id}`,
+    };
+  }
+
+  private toPlaybackTrack(track: any): PlaybackContent {
+    return {
+      type: 'song',
+      id: track.id?.toString() || '',
+      title: track.title || track.name || '',
+      artist: track.artist || '',
+      album: track.album || '',
+      duration: track.duration || 0,
+      coverUrl: track.coverUrl || track.cover || '',
+      url: track.url?.startsWith('http') ? track.url : (track.url || `/audio/${track.id}`),
+    };
+  }
+
+  private getQueueSnapshot() {
+    const state = this.playbackState.getState();
+    return {
+      playlist: state.playlist.map((track) => this.toQueueItem(track)),
+      currentIndex: state.currentIndex,
+      action: state.action,
+      currentTrackId: state.content?.id || null,
+    };
+  }
+
+  private async ensureQueueInitialized() {
+    const managedPlaylist = this.playbackState.getPlaylist();
+    if (managedPlaylist.length > 0) {
+      return this.getQueueSnapshot();
+    }
+
+    const recommendData: any = await this.musicService.getRecommendSongs();
+    if (!recommendData || !recommendData.dailySongs || recommendData.dailySongs.length === 0) {
+      return {
+        playlist: [],
+        currentIndex: 0,
+        action: 'pause',
+        currentTrackId: null,
+      };
+    }
+
+    const songs = recommendData.dailySongs.slice(0, 30);
+    const tracks = songs.map((song: any) => ({
+      type: 'song' as const,
+      id: song.id.toString(),
+      title: song.name,
+      artist: song.ar.map((a: any) => a.name).join(' / '),
+      album: song.al?.name || '',
+      duration: song.dt ? Math.floor(song.dt / 1000) : 0,
+      coverUrl: song.al.picUrl || '',
+      url: `/audio/${song.id}`,
+    }));
+    this.playbackState.setPlaylist(tracks);
+    return this.getQueueSnapshot();
+  }
 
   // ========== 播放状态 ==========
 
@@ -35,9 +99,9 @@ export class AppController {
 
     switch (command) {
       case 'play':
-        this.playbackState.getState().action === 'pause'
-          ? this.playbackState.updateState({ action: 'play' })
-          : null;
+        if (this.playbackState.getState().action === 'pause') {
+          this.playbackState.updateState({ action: 'play' });
+        }
         break;
       case 'pause':
         this.playbackState.setPaused();
@@ -68,14 +132,95 @@ export class AppController {
         status = 'error';
     }
 
-    // 通过 WebSocket 广播控制确认
+    const state = this.playbackState.getState();
     this.chatGateway.broadcastNowPlaying({
       action: command,
-      content: this.playbackState.getState().content,
-      position: this.playbackState.getState().position,
+      content: state.content,
+      position: state.position,
+      currentIndex: state.currentIndex,
+      queue: this.getQueueSnapshot(),
     });
 
-    return { status, command };
+    return { status, command, queue: this.getQueueSnapshot() };
+  }
+
+  @Get('api/queue')
+  async getQueue() {
+    return this.ensureQueueInitialized();
+  }
+
+  @Post('api/queue/add')
+  @HttpCode(HttpStatus.OK)
+  async addQueueTrack(
+    @Body('track') track?: any,
+    @Body('tracks') tracks?: any[],
+    @Body('insertAt') insertAt?: number,
+    @Body('playNow') playNow?: boolean,
+    @Body('source') source?: 'manual' | 'chat' | 'radio_auto',
+  ) {
+    const incoming = Array.isArray(tracks) ? tracks : (track ? [track] : []);
+    if (incoming.length === 0) {
+      return { status: 'error', message: 'Track is required' };
+    }
+
+    const mappedTracks = incoming.map((item) => this.toPlaybackTrack(item));
+    const stateBefore = this.playbackState.getState();
+    const resolvedInsertAt = typeof insertAt === 'number'
+      ? Math.max(0, Math.min(insertAt, stateBefore.playlist.length))
+      : stateBefore.currentIndex + 1;
+
+    this.playbackState.addToPlaylist(mappedTracks, resolvedInsertAt);
+
+    if (playNow) {
+      this.playbackState.setCurrentIndex(resolvedInsertAt);
+      this.playbackState.updateState({ action: 'play' });
+    }
+
+    const queue = this.getQueueSnapshot();
+    this.chatGateway.broadcastPlaylistUpdate({
+      action: 'add',
+      songs: mappedTracks,
+      playlist: queue.playlist,
+      currentIndex: queue.currentIndex,
+      source: source || 'manual',
+    });
+
+    if (playNow) {
+      const state = this.playbackState.getState();
+      this.chatGateway.broadcastNowPlaying({
+        action: 'play',
+        content: state.content,
+        position: state.position,
+        currentIndex: state.currentIndex,
+        queue,
+      });
+    }
+
+    return { status: 'success', queue };
+  }
+
+  @Post('api/queue/select')
+  @HttpCode(HttpStatus.OK)
+  async selectQueueTrack(@Body('index') index: number) {
+    const queue = await this.ensureQueueInitialized();
+    if (typeof index !== 'number' || index < 0 || index >= queue.playlist.length) {
+      return { status: 'error', message: 'Invalid queue index' };
+    }
+
+    this.playbackState.setCurrentIndex(index);
+    this.playbackState.updateState({ action: 'play' });
+
+    const state = this.playbackState.getState();
+    const snapshot = this.getQueueSnapshot();
+    this.chatGateway.broadcastNowPlaying({
+      action: 'play',
+      content: state.content,
+      position: state.position,
+      currentIndex: state.currentIndex,
+      queue: snapshot,
+    });
+
+    return { status: 'success', queue: snapshot };
   }
 
   // ========== 网易云登录 ==========
@@ -164,47 +309,8 @@ export class AppController {
 
   @Get('playlist')
   async getPlaylist() {
-    // 优先返回 PlaybackStateService 中的播放列表
-    const managedPlaylist = this.playbackState.getPlaylist();
-    if (managedPlaylist.length > 0) {
-      return managedPlaylist.map((track) => ({
-        id: track.id,
-        name: track.title,
-        artist: track.artist || '',
-        cover: track.coverUrl || '',
-        url: track.url || `/audio/${track.id}`,
-      }));
-    }
-
-    // fallback 到每日推荐
-    const recommendData: any = await this.musicService.getRecommendSongs();
-    if (!recommendData || !recommendData.dailySongs || recommendData.dailySongs.length === 0) {
-      return { error: 'No recommended songs found' };
-    }
-
-    const songs = recommendData.dailySongs.slice(0, 30);
-    const playlist = songs.map((song: any) => ({
-      id: song.id,
-      name: song.name,
-      artist: song.ar.map((a: any) => a.name).join(' / '),
-      cover: song.al.picUrl,
-      url: `/audio/${song.id}`,
-    }));
-
-    // 同步到 PlaybackStateService
-    const tracks = songs.map((song: any) => ({
-      type: 'song' as const,
-      id: song.id.toString(),
-      title: song.name,
-      artist: song.ar.map((a: any) => a.name).join(' / '),
-      album: song.al?.name || '',
-      duration: song.dt ? Math.floor(song.dt / 1000) : 0,
-      coverUrl: song.al.picUrl || '',
-      url: `/audio/${song.id}`,
-    }));
-    this.playbackState.setPlaylist(tracks);
-
-    return playlist;
+    const queue = await this.ensureQueueInitialized();
+    return queue.playlist;
   }
 
   // ========== 音频流 ==========
@@ -226,7 +332,6 @@ export class AppController {
       headers: range ? { Range: range } : undefined,
     });
 
-    // 链接过期（403/404）→ 刷新缓存重试一次
     if ((response.status === 403 || response.status === 404) && !response.ok) {
       console.log(`Audio URL expired for ${id}, refreshing and retrying...`);
       try {

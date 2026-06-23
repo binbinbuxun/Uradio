@@ -1,14 +1,17 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+﻿import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../api';
 import { parseLRC } from '../utils';
 
 interface AudioPlayerState {
   isPlaying: boolean;
+  setIsPlaying: React.Dispatch<React.SetStateAction<boolean>>;
   isLoading: boolean;
+  setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
   volume: number;
   audioProgress: { current: number; duration: number };
   currentLyric: string;
   showLyrics: boolean;
+  currentSong: any;
   currentLyricIndex: number;
   lyricLines: { time: number; text: string }[];
   radioMode: boolean;
@@ -16,6 +19,7 @@ interface AudioPlayerState {
   errorToast: string | null;
   audioRef: React.RefObject<HTMLAudioElement | null>;
   ttsAudioRef: React.RefObject<HTMLAudioElement | null>;
+  ttsChunksRef: React.RefObject<Map<number, string[]>>;
   gainNodeRef: React.RefObject<GainNode | null>;
   audioContextRef: React.RefObject<AudioContext | null>;
   isFadingRef: React.RefObject<boolean>;
@@ -23,6 +27,10 @@ interface AudioPlayerState {
   crossfadeNext: () => void;
   crossfadePrev: () => void;
   handlePlayPause: () => void;
+  handleSongEnd: () => Promise<void>;
+  handleTrackError: () => void;
+  handleTimeUpdate: () => void;
+  handleLoadedMetadata: () => void;
   handleSeekStart: () => void;
   handleSeekChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   handleSeekEnd: () => void;
@@ -65,6 +73,20 @@ export function useAudioPlayer(
   const openingPlayedRef = useRef(false);
 
   const currentSong = playlist.length > 0 ? playlist[currentIndex] : null;
+  const toAbsoluteAudioUrl = (url: string) => url.startsWith('http') ? url : 'http://localhost:3000' + url;
+  const applyQueueState = (queue?: { playlist?: any[]; currentIndex?: number }) => {
+    if (!queue) return;
+    if (Array.isArray(queue.playlist)) {
+      setPlaylist(queue.playlist.map((item: any) => ({
+        ...item,
+        id: item.id?.toString?.() || item.id,
+        url: item.url?.startsWith('http') ? item.url : 'http://localhost:3000' + item.url,
+      })));
+    }
+    if (typeof queue.currentIndex === 'number') {
+      setCurrentIndex(queue.currentIndex);
+    }
+  };
 
   // AudioContext init
   useEffect(() => {
@@ -206,6 +228,7 @@ export function useAudioPlayer(
     const nextIndex = (currentIndex + 1) % playlist.length;
     setCurrentIndex(nextIndex);
     setIsPlaying(true);
+    api.selectQueueTrack(nextIndex).catch(console.error);
   }, [playlist.length, currentIndex, setCurrentIndex]);
 
   const handleSongEnd = useCallback(async () => {
@@ -213,7 +236,11 @@ export function useAudioPlayer(
 
     if (radioMode) {
       try {
-        const segue = await api.getSegueNext();
+        let segue = await api.getSegueNext();
+        if ((!segue?.ttsBase64 || !segue.text) && currentSong?.id) {
+          await api.prefetchNext(currentSong.id, volume).catch(() => null);
+          segue = await api.getSegueNext();
+        }
         if (segue?.ttsBase64 && segue.text) {
           const arr = new Uint8Array(
             atob(segue.ttsBase64).split('').map(c => c.charCodeAt(0)),
@@ -246,14 +273,16 @@ export function useAudioPlayer(
               name: s.name,
               artist: s.artist,
               cover: s.cover,
-              url: `/audio/${s.id}`,
+              url: '/audio/' + s.id,
             }));
-            setPlaylist(prev => {
-              const insertAt = currentIndex + 1;
-              const updated = [...prev];
-              updated.splice(insertAt, 0, ...newTracks);
-              return updated;
+            const result = await api.addQueueTrack({
+              tracks: newTracks,
+              insertAt: currentIndex + 1,
+              source: 'radio_auto',
             });
+            if (result.queue) {
+              applyQueueState(result.queue);
+            }
           }
         }
       } catch {
@@ -264,6 +293,7 @@ export function useAudioPlayer(
     const nextIndex = (currentIndex + 1) % playlist.length;
     setCurrentIndex(nextIndex);
     setIsPlaying(true);
+    api.selectQueueTrack(nextIndex).catch(console.error);
   }, [playlist.length, currentIndex, radioMode, setCurrentIndex, setPlaylist]);
 
   const prevTrack = useCallback(() => {
@@ -271,6 +301,7 @@ export function useAudioPlayer(
     const nextIndex = (currentIndex - 1 + playlist.length) % playlist.length;
     setCurrentIndex(nextIndex);
     setIsPlaying(true);
+    api.selectQueueTrack(nextIndex).catch(console.error);
   }, [playlist.length, currentIndex, setCurrentIndex]);
 
   // Crossfade
@@ -370,11 +401,11 @@ export function useAudioPlayer(
     }
 
     if (!isPlaying && radioMode && !openingPlayedRef.current && currentSong) {
-      openingPlayedRef.current = true;
       console.log('[Opening] Fetching opening TTS... volume=', volume);
       api.getOpening(volume).then((opening) => {
         console.log('[Opening] API response:', opening);
         if (opening?.ttsBase64) {
+          openingPlayedRef.current = true;
           try {
             const arr = new Uint8Array(
               atob(opening.ttsBase64).split('').map(c => c.charCodeAt(0)),
@@ -489,7 +520,7 @@ export function useAudioPlayer(
         urls.forEach((url: string) => {
           const preloadAudio = new Audio();
           preloadAudio.preload = 'auto';
-          preloadAudio.src = url;
+          preloadAudio.src = toAbsoluteAudioUrl(url);
         });
       }).catch(console.error);
     }
@@ -545,7 +576,9 @@ export function useAudioPlayer(
     ttsAudioRef,
     ttsChunksRef,
     gainNodeRef,
+    audioContextRef,
     isFadingRef,
+    openingPlayedRef,
     currentSong,
     crossfadeNext,
     crossfadePrev,
@@ -563,3 +596,15 @@ export function useAudioPlayer(
     setErrorToast,
   };
 }
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+﻿import React, { useState } from 'react';
 import { ArrowUp, ChevronDown, ChevronUp } from 'lucide-react';
 
 interface ChatPanelProps {
@@ -47,7 +47,7 @@ const ChatPanel: React.FC<ChatPanelProps> = React.memo(({
   djStreamIdRef,
   chatInput,
   playlist,
-  currentIndex,
+  currentIndex: _currentIndex,
   chatContainerRef,
   onInputChange,
   onSend,
@@ -228,3 +228,8 @@ const ChatPanel: React.FC<ChatPanelProps> = React.memo(({
 });
 
 export default ChatPanel;
+
+
+
+
+

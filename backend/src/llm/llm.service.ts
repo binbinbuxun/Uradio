@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+﻿import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
@@ -88,6 +88,120 @@ keyword 是用于音乐搜索引擎的精确搜索词，必须符合以下规则
   };
 
   /**
+   * 净化 say 字段：去除历史上下文注入的系统标记，防止 LLM 模仿输出
+   * 去掉 [推荐: ...] (旧格式) 和 [系统记录: ...] (新格式)
+   */
+  private sanitizeSay(say: string): string {
+    if (!say) return say;
+    return say
+      .replace(/\s*\[[^:\]]+:[^\]]*\]\s*/g, '')
+      .trim();
+  }
+
+  private finalizeSegueText(text: string, nextTitle: string, nextArtist: string): string {
+    const artistPrefix = nextArtist ? nextArtist + '的' : '';
+    const fallback = '接下来这首，听听' + artistPrefix + nextTitle + '。';
+    const cleaned = this.sanitizeSay(text)
+      .replace(/^[\u201c\u201d"' + "'" + '`]+|[\u201c\u201d"' + "'" + '`]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!cleaned) return fallback;
+
+    const stripped = cleaned.replace(/[\uFF0C\u3001\uFF1A\uFF1B,;\-\u2014\u2013\s]+$/g, '').trim();
+    if (!stripped || stripped.length < 6) return fallback;
+
+    if (/[\u3002\uFF01\uFF1F!?]$/.test(cleaned)) {
+      return cleaned;
+    }
+
+    if (/[\uFF0C\u3001\uFF1A\uFF1B,;\-\u2014\u2013]$/.test(cleaned)) {
+      return stripped + '，接下来听' + artistPrefix + nextTitle + '。';
+    }
+
+    return stripped + '。';
+  }
+
+  private parseSongLine(line: string): { keyword: string; title?: string; artist?: string } | null {
+    const cleaned = line
+      .replace(/^[-*\u2022]+\s*/, '')
+      .replace(/^\d+\s*[.)\u3001]\s*/, '')
+      .trim();
+    if (!cleaned) return null;
+
+    const quoted = cleaned.match(/\u300a([^\u300b]+)\u300b/);
+    if (quoted) {
+      const title = quoted[1].trim();
+      const rest = cleaned
+        .replace(quoted[0], '')
+        .replace(/^[\s:\uFF1A\-\u2013\u2014]+|[\s:\uFF1A\-\u2013\u2014]+$/g, '')
+        .replace(/^\u7684+|\u7684+$/g, '')
+        .trim();
+      return {
+        keyword: rest ? `${title} ${rest}` : title,
+        title,
+        artist: rest || undefined,
+      };
+    }
+
+    const pairMatch = cleaned.match(/^(.+?)\s*[\-\u2013\u2014]\s*(.+)$/);
+    if (pairMatch) {
+      const title = pairMatch[1].trim();
+      const artist = pairMatch[2].trim();
+      if (title && artist) {
+        return {
+          keyword: `${title} ${artist}`,
+          title,
+          artist,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  private parsePlainTextStructuredReply(raw: string): StructuredResponse {
+    const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const sayLines: string[] = [];
+    const play: StructuredResponse['play'] = [];
+
+    for (const line of lines) {
+      const looksLikeSongLine = /^[-*\u2022]\s+/.test(line)
+        || /^\d+\s*[.)\u3001]\s+/.test(line)
+        || /^[^\n.!?\u3002\uff01\uff1f]{1,80}\s*[\-\u2013\u2014]\s*[^\n.!?\u3002\uff01\uff1f]{1,80}$/.test(line);
+
+      if (looksLikeSongLine) {
+        const parsed = this.parseSongLine(line);
+        if (parsed) {
+          play.push(parsed);
+          continue;
+        }
+      }
+
+      sayLines.push(line);
+    }
+
+    if (play.length === 0) {
+      const songMatches = raw.match(/《(.+?)》/g);
+      if (songMatches) {
+        for (const match of songMatches) {
+          const title = match.replace(/[《》]/g, '').trim();
+          if (title) {
+            play.push({ keyword: title, title });
+          }
+        }
+      }
+    }
+
+    return {
+      say: this.sanitizeSay(sayLines.join(' ').trim()),
+      play,
+      reason: '',
+      action: null,
+    };
+  }
+
+  /**
    * 智能 persona 拼装：按优先级加载文件，超预算时从最低优先级截断/跳过
    * 优先级: dj-persona(1) > mood-rules(2) > taste(3) > routines(4)
    */
@@ -167,7 +281,12 @@ keyword 是用于音乐搜索引擎的精确搜索词，必须符合以下规则
 为歌曲切换做串场介绍。
 当前：${currentArtist} 的《${currentTitle}》
 下一首：${nextArtist} 的《${nextTitle}》
-要求：30字以内，自然有温度，只输出串场词文本。`;
+要求：
+- 只输出1句完整串场词，不要分段，不要解释
+- 30字以内，自然有温度
+- 结尾必须用句号、问号或叹号
+- 不能以逗号、顿号、冒号、分号、省略号或破折号结尾
+- 不要只写半句意象，例如“从回声里走出来，”这种不完整表达。`;
 
     try {
       const response = await fetch(this.apiUrl, {
@@ -195,7 +314,7 @@ keyword 是用于音乐搜索引擎的精确搜索词，必须符合以下规则
 
       const data = await response.json();
       const text = data.choices?.[0]?.message?.content?.trim();
-      return text || null;
+      return text ? this.finalizeSegueText(text, nextTitle, nextArtist) : null;
     } catch (error) {
       this.logger.error(`LLM request failed: ${error}`);
       return null;
@@ -314,7 +433,7 @@ keyword 是用于音乐搜索引擎的精确搜索词，必须符合以下规则
       if (!response.ok) return null;
       const data = await response.json();
       const text = data.choices?.[0]?.message?.content?.trim();
-      return text ? { say: text } : null;
+      return text ? { say: this.sanitizeSay(text) } : null;
     } catch (error) {
       this.logger.error(`LLM opening request failed: ${error}`);
       return null;
@@ -373,7 +492,7 @@ ${recentList}
       try {
         const parsed = JSON.parse(jsonStr);
         return {
-          say: parsed.say || '',
+          say: this.sanitizeSay(parsed.say || ''),
           play: Array.isArray(parsed.play) ? parsed.play.slice(0, 3) : [],
         };
       } catch {
@@ -488,12 +607,7 @@ ${this.KEYWORD_RULES}
       // 智能提取 JSON：找最外层花括号块
       const jsonMatch = raw.match(/\{[\s\S]*"say"[\s\S]*"play"[\s\S]*\}/);
       if (!jsonMatch) {
-        // 没有 JSON → 纯文本，尝试从《》提取歌名
-        const songMatches = raw.match(/《(.+?)》/g);
-        const play = songMatches
-          ? songMatches.map(m => ({ keyword: m.replace(/[《》]/g, '').trim() }))
-          : [];
-        return { say: raw, play, reason: '', action: null };
+        return this.parsePlainTextStructuredReply(raw);
       }
 
       const jsonStr = jsonMatch[0].replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
@@ -502,7 +616,7 @@ ${this.KEYWORD_RULES}
         // 如果 JSON 前有实质性文本，用它作为 say（而非 JSON 内的 say）
         const prefix = raw.slice(0, raw.indexOf(jsonMatch[0])).trim();
         return {
-          say: prefix.length > 5 ? prefix : (parsed.say || ''),
+          say: this.sanitizeSay(prefix.length > 5 ? prefix : (parsed.say || '')),
           play: Array.isArray(parsed.play) ? parsed.play : [],
           reason: parsed.reason || '',
           action: ['play', 'pause', 'next', 'prev'].includes(parsed.action) ? parsed.action : null,
@@ -510,11 +624,7 @@ ${this.KEYWORD_RULES}
       } catch {
         // JSON 解析失败 → 退化为纯文本
         this.logger.warn('Failed to parse structured JSON, falling back to plain text');
-        const songMatches = raw.match(/《(.+?)》/g);
-        const play = songMatches
-          ? songMatches.map(m => ({ keyword: m.replace(/[《》]/g, '').trim() }))
-          : [];
-        return { say: raw, play, reason: '', action: null };
+        return this.parsePlainTextStructuredReply(raw);
       }
     } catch (error) {
       this.logger.error(`LLM structured request failed: ${error}`);
@@ -614,7 +724,7 @@ ${this.KEYWORD_RULES}
           try {
             const parsed = JSON.parse(argsStr);
             return {
-              say: parsed.say || '',
+              say: this.sanitizeSay(parsed.say || ''),
               play: Array.isArray(parsed.play) ? parsed.play : [],
               reason: parsed.reason || '',
               action: ['play', 'pause', 'next', 'prev'].includes(parsed.action) ? parsed.action : null,
@@ -630,8 +740,8 @@ ${this.KEYWORD_RULES}
       // 如果没有 tool_calls（可能模型选择了直接回复），降级
       const content = message?.content?.trim();
       if (content) {
-        this.logger.warn('Function Calling returned plain text instead of tool_call, falling back');
-        return this.chatStructured(messages, systemContext);
+        this.logger.warn('Function Calling returned plain text instead of tool_call, parsing plain text response');
+        return this.parsePlainTextStructuredReply(content);
       }
 
       return null;
@@ -715,3 +825,4 @@ ${feedbackLines.join('\n')}
     }
   }
 }
+

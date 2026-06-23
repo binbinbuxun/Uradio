@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+﻿import { Injectable, Logger } from '@nestjs/common';
 
 export type PlaybackAction = 'play' | 'pause' | 'ended' | 'next' | 'prev';
 export type ContentType = 'song' | 'tts';
@@ -48,7 +48,6 @@ export class PlaybackStateService {
   private lastUpdate = Date.now();
 
   getState(): PlaybackState {
-    // 根据时间估算当前位置
     if (this.state.action === 'play' && this.state.content) {
       const elapsed = (Date.now() - this.lastUpdate) / 1000;
       this.state.position = Math.min(
@@ -57,7 +56,14 @@ export class PlaybackStateService {
       );
       this.lastUpdate = Date.now();
     }
-    return { ...this.state };
+    return {
+      ...this.state,
+      playlist: [...this.state.playlist],
+      queue: {
+        next: [...this.state.queue.next],
+        history: [...this.state.queue.history],
+      },
+    };
   }
 
   updateState(update: Partial<PlaybackState>) {
@@ -75,7 +81,7 @@ export class PlaybackStateService {
 
   setPaused() {
     if (this.state.action === 'play') {
-      this.state.position = this.getState().position; // 确保位置已同步
+      this.state.position = this.getState().position;
     }
     this.state.action = 'pause';
     this.lastUpdate = Date.now();
@@ -85,7 +91,6 @@ export class PlaybackStateService {
     if (this.state.content) {
       this.state.queue.history.push(this.state.content.id);
     }
-    // 优先使用 playlist 导航
     if (this.state.playlist.length > 0) {
       const nextIndex = this.state.currentIndex + 1;
       if (nextIndex >= this.state.playlist.length) {
@@ -105,7 +110,7 @@ export class PlaybackStateService {
       this.lastUpdate = Date.now();
       return this.state.content;
     }
-    // fallback 到 queue
+
     const nextId = this.state.queue.next.shift();
     if (!nextId) {
       this.state.action = 'ended';
@@ -143,16 +148,32 @@ export class PlaybackStateService {
   }
 
   setPlaylist(tracks: PlaybackContent[]) {
-    this.state.playlist = tracks;
+    this.state.playlist = [...tracks];
     this.state.currentIndex = 0;
     if (tracks.length > 0) {
       this.state.content = tracks[0];
+    } else {
+      this.state.content = null;
     }
+    this.state.position = 0;
     this.lastUpdate = Date.now();
   }
 
-  addToPlaylist(tracks: PlaybackContent[]) {
-    this.state.playlist.push(...tracks);
+  addToPlaylist(tracks: PlaybackContent[], insertAt?: number) {
+    if (tracks.length === 0) return;
+    if (typeof insertAt === 'number') {
+      const safeIndex = Math.max(0, Math.min(insertAt, this.state.playlist.length));
+      this.state.playlist.splice(safeIndex, 0, ...tracks);
+      if (safeIndex <= this.state.currentIndex && this.state.playlist.length > tracks.length) {
+        this.state.currentIndex += tracks.length;
+      }
+    } else {
+      this.state.playlist.push(...tracks);
+    }
+    if (!this.state.content && this.state.playlist.length > 0) {
+      this.state.currentIndex = Math.max(0, Math.min(this.state.currentIndex, this.state.playlist.length - 1));
+      this.state.content = this.state.playlist[this.state.currentIndex];
+    }
     this.lastUpdate = Date.now();
   }
 
@@ -165,6 +186,8 @@ export class PlaybackStateService {
       this.state.currentIndex = Math.min(this.state.currentIndex, this.state.playlist.length - 1);
       if (this.state.playlist.length > 0) {
         this.state.content = this.state.playlist[this.state.currentIndex];
+      } else {
+        this.state.content = null;
       }
     }
     this.lastUpdate = Date.now();

@@ -1,8 +1,20 @@
-import { useState, useEffect, useRef } from 'react';
+﻿import { useState, useEffect, useRef } from 'react';
 import { api, connectStream } from '../api';
 
+type ChatUiMessage = {
+  id: string;
+  role: 'user' | 'dj';
+  content: string;
+  timestamp: number;
+  chatId?: string;
+  recommendedSongs?: any[];
+  searchResults?: any[];
+  source?: 'chat' | 'radio_auto';
+  ttsFailed?: boolean;
+};
+
 interface ChatState {
-  chatMessages: { id: string; role: 'user' | 'dj'; content: string; timestamp: number; recommendedSongs?: any[]; searchResults?: any[] }[];
+  chatMessages: ChatUiMessage[];
   chatInput: string;
   isDjTyping: boolean;
   wsConnected: boolean;
@@ -23,10 +35,10 @@ interface ChatState {
 export function useChat(
   volume: number,
   gainNodeRef: React.RefObject<GainNode | null>,
-  isFadingRef: React.RefObject<boolean>,
+  _isFadingRef: React.RefObject<boolean>,
   ttsChunksRef: React.RefObject<Map<number, string[]>>,
   ttsAudioRef: React.RefObject<HTMLAudioElement | null>,
-  playlist: any[],
+  _playlist: any[],
   currentIndex: number,
   setPlaylist: React.Dispatch<React.SetStateAction<any[]>>,
   setCurrentIndex: React.Dispatch<React.SetStateAction<number>>,
@@ -35,7 +47,7 @@ export function useChat(
   crossfadePrev: () => void,
   setErrorToast: (msg: string | null) => void,
 ): ChatState {
-  const [chatMessages, setChatMessages] = useState<{ id: string; role: 'user' | 'dj'; content: string; timestamp: number; recommendedSongs?: any[]; searchResults?: any[] }[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatUiMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isDjTyping, setIsDjTyping] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
@@ -49,6 +61,22 @@ export function useChat(
   const djStreamClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const skipHistoryLoadRef = useRef(false); // 新建对话时跳过自动加载
 
+  const mapQueueTrack = (item: any) => ({
+    ...item,
+    id: item.id?.toString?.() || item.id,
+    name: item.name || item.title || '',
+    url: item.url?.startsWith('http') ? item.url : 'http://localhost:3000' + item.url,
+  });
+
+  const applyQueueState = (queue?: { playlist?: any[]; currentIndex?: number }) => {
+    if (!queue) return;
+    if (Array.isArray(queue.playlist)) {
+      setPlaylist(queue.playlist.map(mapQueueTrack));
+    }
+    if (typeof queue.currentIndex === 'number') {
+      setCurrentIndex(queue.currentIndex);
+    }
+  };
   // Auto-scroll chat
   useEffect(() => {
     chatContainerRef.current?.scrollTo({
@@ -105,6 +133,23 @@ export function useChat(
         const binary = msg.binary as ArrayBuffer | undefined;
         const { delta, done, metadata } = payload;
 
+        // 初始空 delta 信号：提前创建 DJ 消息，确保 djStreamIdRef/chatId 就绪
+        // 解决: 1) LLM 返回空 say 时无后续 delta → 消息永不创建
+        //       2) recommendedSongs 与首个 delta 同时到达的竞争问题
+        if (!delta && !done && metadata?.chatId && !djStreamIdRef.current) {
+          msgCounter.current++;
+          const newId = `dj_${msgCounter.current}`;
+          djStreamIdRef.current = newId;
+          djStreamChatIdRef.current = metadata.chatId;
+          ttsChunksRef.current = new Map();
+          setIsDjTyping(true);
+          setChatMessages((msgs) => [
+            ...msgs,
+            { id: newId, role: 'dj', content: '', timestamp: Date.now(), chatId: metadata.chatId, source: metadata?.source || 'chat' },
+          ]);
+          return;
+        }
+
         if (delta && !djStreamIdRef.current) {
           msgCounter.current++;
           const newId = `dj_${msgCounter.current}`;
@@ -114,7 +159,7 @@ export function useChat(
           setIsDjTyping(true);
           setChatMessages((msgs) => [
             ...msgs,
-            { id: newId, role: 'dj', content: delta, timestamp: Date.now(), chatId: metadata?.chatId },
+            { id: newId, role: 'dj', content: delta, timestamp: Date.now(), chatId: metadata?.chatId, source: metadata?.source || 'chat' },
           ]);
           return;
         }
@@ -231,10 +276,20 @@ export function useChat(
             }
             if (idx >= 0) {
               const updated = [...msgs];
-              updated[idx] = { ...updated[idx], recommendedSongs: songs };
+              updated[idx] = { ...updated[idx], recommendedSongs: songs, source: metadata?.source || updated[idx].source || 'chat' };
               return updated;
             }
-            return msgs;
+            // 兜底: 未匹配到消息时创建新的 DJ 消息，避免音乐卡片丢失
+            msgCounter.current++;
+            return [...msgs, {
+              id: `dj_${msgCounter.current}`,
+              role: 'dj' as const,
+              content: '',
+              timestamp: Date.now(),
+              chatId: targetChatId,
+              recommendedSongs: songs,
+              source: metadata?.source || 'chat',
+            }];
           });
         }
 
@@ -251,7 +306,7 @@ export function useChat(
             }
             if (idx >= 0) {
               const updated = [...msgs];
-              updated[idx] = { ...updated[idx], searchResults: songs };
+              updated[idx] = { ...updated[idx], searchResults: songs, source: metadata?.source || updated[idx].source || 'chat' };
               return updated;
             }
             return msgs;
@@ -266,6 +321,26 @@ export function useChat(
             djStreamChatIdRef.current = null;
           }, 2000);
           setIsDjTyping(false);
+        }
+      }
+
+      // 串场事件: 后端 prefetch 生成串场词后通过 WS 广播，前端显示到聊天面板
+      if (msg.type === 'segue') {
+        const data = msg.data?.data || msg.data;
+        const segueText = data.text;
+        if (segueText) {
+          msgCounter.current++;
+          setChatMessages((msgs) => [
+            ...msgs,
+            {
+              id: `dj_segue_${msgCounter.current}`,
+              role: 'dj' as const,
+              content: segueText,
+              timestamp: Date.now(),
+              recommendedSongs: data.recommendedSongs,
+              source: data.source || 'radio_auto',
+            },
+          ]);
         }
       }
 
@@ -306,25 +381,11 @@ export function useChat(
 
       if (msg.type === 'playlist-update') {
         const payload = msg.data?.data || msg.data;
-        const { action, songs, playlist: newPlaylist } = payload;
-
-        const mapTrack = (item: any) => ({
-          ...item,
-          name: item.name || item.title || '',
-          url: item.url?.startsWith('http') ? item.url : `http://localhost:3000${item.url}`,
-        });
-
-        if (action === 'replace' && newPlaylist) {
-          setPlaylist(newPlaylist.map(mapTrack));
-        } else if (action === 'add' && songs) {
-          setPlaylist(prev => {
-            const updated = [...prev];
-            const insertAt = currentIndex + 1;
-            updated.splice(insertAt, 0, ...songs.map(mapTrack));
-            return updated;
-          });
-        } else if (action === 'remove' && newPlaylist) {
-          setPlaylist(newPlaylist.map(mapTrack));
+        if (payload.playlist) {
+          setPlaylist(payload.playlist.map(mapQueueTrack));
+        }
+        if (typeof payload.currentIndex === 'number') {
+          setCurrentIndex(payload.currentIndex);
         }
       }
     }, setWsConnected);
@@ -391,26 +452,32 @@ export function useChat(
   };
 
   const handleAddTrack = (song: any) => {
-    const newTrack = {
-      id: song.id,
-      name: song.name,
-      artist: song.artist,
-      cover: song.cover,
-      url: song.url?.startsWith('http') ? song.url : `http://localhost:3000${song.url}`,
-    };
-    setPlaylist(prev => {
-      const nextIndex = currentIndex + 1;
-      const updated = [...prev];
-      updated.splice(nextIndex, 0, newTrack);
-      return updated;
-    });
-    setCurrentIndex(prev => prev + 1);
-    setIsPlaying(true);
+    api.addQueueTrack({
+      track: {
+        id: song.id,
+        name: song.name,
+        artist: song.artist,
+        cover: song.cover,
+        url: song.url,
+      },
+      insertAt: currentIndex + 1,
+      playNow: true,
+      source: 'manual',
+    }).then((result) => {
+      if (result.queue) {
+        applyQueueState(result.queue);
+        setIsPlaying(true);
+      }
+    }).catch(console.error);
   };
 
   const handleQueueSelect = (index: number) => {
-    setCurrentIndex(index);
-    setIsPlaying(true);
+    api.selectQueueTrack(index).then((result) => {
+      if (result.queue) {
+        applyQueueState(result.queue);
+        setIsPlaying(true);
+      }
+    }).catch(console.error);
   };
 
   return {
@@ -432,3 +499,8 @@ export function useChat(
     handleQueueSelect,
   };
 }
+
+
+
+
+

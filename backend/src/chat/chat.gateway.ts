@@ -1,4 +1,4 @@
-import {
+﻿import {
   SubscribeMessage,
   WebSocketGateway,
   WebSocketServer,
@@ -11,7 +11,6 @@ import { Logger } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import { PlaybackStateService } from '../state/playback-state.service';
 
-// 信令类型
 export enum WsMessageType {
   NOW_PLAYING = 'now-playing',
   CONTROL = 'control',
@@ -20,13 +19,12 @@ export enum WsMessageType {
   PLAYLIST_UPDATE = 'playlist-update',
   PLAYBACK_CMD = 'playback-cmd',
   CHAT_SEND = 'chat-send',
-  SEGUE = 'segue',           // 串场事件 (segue / recommendation / opening)
-  TRACE = 'execution-trace',  // 执行轨迹
+  SEGUE = 'segue',
+  TRACE = 'execution-trace',
   PING = 'ping',
   PONG = 'pong',
 }
 
-// 通用信封
 export interface WsEnvelope<T> {
   type: WsMessageType;
   ts: number;
@@ -57,13 +55,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.logger.log(`Client connected: ${client.id}`);
     this.clientSeqMap.set(client.id, 0);
 
-    // 连接后立即推送当前播放状态
     const state = this.playbackState.getState();
     if (state.content) {
       this.sendToClient(client, WsMessageType.NOW_PLAYING, {
         action: state.action,
         content: state.content,
         position: state.position,
+        currentIndex: state.currentIndex,
       });
     }
   }
@@ -85,9 +83,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     switch (command) {
       case 'play':
-        this.playbackState.getState().action === 'pause'
-          ? this.playbackState.updateState({ action: 'play' })
-          : null;
+        if (this.playbackState.getState().action === 'pause') {
+          this.playbackState.updateState({ action: 'play' });
+        }
         break;
       case 'pause':
         this.playbackState.setPaused();
@@ -109,7 +107,6 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         status = 'error';
     }
 
-    // 广播控制确认
     this.broadcast(WsMessageType.CONTROL, {
       command,
       status,
@@ -125,7 +122,6 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() payload: { message: string; timestamp: number },
   ) {
     this.logger.log(`Chat from ${client.id}: ${payload.message}`);
-    // 实际处理在 ChatController 中，这里仅确认收到
     return { event: 'chat-ack', data: { received: true } };
   }
 
@@ -137,12 +133,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     };
   }
 
-  // === 广播方法 ===
-
   broadcastNowPlaying(data: {
     action: string;
     content: any;
     position?: number;
+    currentIndex?: number;
     queue?: any;
   }) {
     this.broadcast(WsMessageType.NOW_PLAYING, data);
@@ -158,7 +153,6 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   broadcastTtsChunk(chatId: string, sentenceIndex: number, sentenceCount: number, audioBuffer: Buffer) {
-    // Socket.IO 原生二进制传输 — Buffer 作为第二参数，避免 base64 膨胀
     this.server.emit(WsMessageType.CHAT_STREAM, {
       type: WsMessageType.CHAT_STREAM,
       ts: Date.now(),
@@ -184,6 +178,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     songs?: any[];
     index?: number;
     playlist?: any[];
+    currentIndex?: number;
+    source?: 'manual' | 'chat' | 'radio_auto';
   }) {
     this.broadcast(WsMessageType.PLAYLIST_UPDATE, data);
   }
@@ -195,6 +191,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     artist?: string;
     recommendedSongs?: any[];
     chatId?: string;
+    source?: 'radio_auto';
   }) {
     this.broadcast(WsMessageType.SEGUE, data);
   }
@@ -209,8 +206,6 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }) {
     this.broadcast(WsMessageType.TRACE, data);
   }
-
-  // === 私有方法 ===
 
   private broadcast(type: WsMessageType, data: any) {
     this.seq++;

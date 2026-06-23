@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+﻿import { useState, useEffect, useCallback } from 'react';
 import { api } from './api';
 import { useAudioPlayer } from './hooks/useAudioPlayer';
 import { useChat } from './hooks/useChat';
@@ -19,15 +19,13 @@ function App() {
 
   // Load playlist
   const loadPlaylist = useCallback(() => {
-    fetch('http://localhost:3000/playlist')
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) {
-          setPlaylist(data.map((item: any) => ({
-            ...item,
-            url: item.url?.startsWith('http') ? item.url : `http://localhost:3000${item.url}`,
-          })));
-        }
+    api.getQueue()
+      .then((queue) => {
+        setCurrentIndex(queue.currentIndex || 0);
+        setPlaylist((queue.playlist || []).map((item: any) => ({
+          ...item,
+          url: item.url?.startsWith('http') ? item.url : 'http://localhost:3000' + item.url,
+        })));
       })
       .catch(console.error);
   }, []);
@@ -262,3 +260,8 @@ function App() {
 }
 
 export default App;
+
+
+
+
+

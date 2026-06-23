@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Delete, Body, Req, HttpCode, HttpStatus, Query, Param } from '@nestjs/common';
+﻿import { Controller, Post, Get, Delete, Body, Req, HttpCode, HttpStatus, Query, Param } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ChatGateway } from './chat.gateway';
@@ -34,9 +34,67 @@ export class ChatController {
     private readonly playHistoryRepo: Repository<PlayHistory>,
   ) {}
 
-  // ─── 会话管理端点 ───────────────────────────────────────
+  private serializeChatMessage(message: ChatMessage) {
+    const source = message.metadata?.source || (message.metadata?.segueType ? 'radio_auto' : 'chat');
+    return {
+      id: `msg_${message.id}`,
+      chatId: message.chatId,
+      role: message.role,
+      content: message.content,
+      timestamp: message.createdAt.getTime(),
+      sessionId: message.sessionId,
+      source,
+      recommendedSongs: message.metadata?.recommendedSongs || undefined,
+      searchResults: message.metadata?.searchResults || undefined,
+      segueType: message.metadata?.segueType || undefined,
+      songTitle: message.metadata?.songTitle || undefined,
+      artist: message.metadata?.artist || undefined,
+      executionTrace: message.metadata?.executionTrace || undefined,
+    };
+  }
 
-  /** 获取所有会话列表 */
+  private async persistDjMessage(
+    chatId: string,
+    sessionId: number | null,
+    content: string,
+    structuredReason: string | undefined,
+    executionTrace: any,
+    recommendedSongs: any[],
+    searchResults: any[],
+  ) {
+    const existing = await this.chatMessageRepo.findOne({
+      where: { chatId, role: 'dj' },
+      order: { id: 'DESC' },
+    });
+
+    const payload = {
+      chatId,
+      role: 'dj' as const,
+      content,
+      sessionId,
+      metadata: {
+        source: 'chat' as const,
+        recommendedSongs: recommendedSongs.length > 0 ? recommendedSongs : undefined,
+        searchResults: searchResults.length > 0 ? searchResults : undefined,
+        structuredReason: structuredReason || undefined,
+        executionTrace,
+      },
+    };
+
+    if (existing) {
+      existing.content = payload.content;
+      existing.sessionId = payload.sessionId;
+      existing.metadata = payload.metadata;
+      await this.chatMessageRepo.save(existing);
+      return;
+    }
+
+    await this.chatMessageRepo.save(this.chatMessageRepo.create(payload));
+  }
+
+  // 会话管理：获取、创建、读取和删除聊天会话
+
+  /** 获取会话列表 */
   @Get('chat/sessions')
   @HttpCode(HttpStatus.OK)
   async getSessions() {
@@ -44,7 +102,7 @@ export class ChatController {
     return { status: 'success', sessions };
   }
 
-  /** 创建新会话 */
+  /** 创建会话 */
   @Post('chat/sessions')
   @HttpCode(HttpStatus.OK)
   async createSession(@Body('title') title?: string) {
@@ -52,7 +110,7 @@ export class ChatController {
     return { status: 'success', session };
   }
 
-  /** 获取会话的所有消息 */
+  /** 获取会话消息 */
   @Get('chat/sessions/:id/messages')
   @HttpCode(HttpStatus.OK)
   async getSessionMessages(@Param('id') id: string) {
@@ -63,18 +121,11 @@ export class ChatController {
     return {
       status: 'success',
       session: result.session,
-      messages: result.messages.map(m => ({
-        id: m.id,
-        chatId: m.chatId,
-        role: m.role,
-        content: m.content,
-        timestamp: m.createdAt.getTime(),
-        metadata: m.metadata,
-      })),
+      messages: result.messages.map((m) => this.serializeChatMessage(m)),
     };
   }
 
-  /** 删除会话（消息保留，sessionId 置 null） */
+  /** 删除会话，并将关联消息的 sessionId 置为 null */
   @Delete('chat/sessions/:id')
   @HttpCode(HttpStatus.OK)
   async deleteSession(@Param('id') id: string) {
@@ -84,7 +135,7 @@ export class ChatController {
     return { status: 'success' };
   }
 
-  // ─── 对话端点 ───────────────────────────────────────────
+  // 聊天主流程：先处理显式指令，再补充上下文并调用 LLM
 
   @Post('chat')
   @HttpCode(HttpStatus.OK)
@@ -98,7 +149,7 @@ export class ChatController {
       return { status: 'error', message: 'Message is required' };
     }
 
-    // ── 会话处理 ──────────────────────────────────────
+    // 解析 sessionId，只复用已存在的会话
     let sessionId: number | null = null;
     if (sessionIdStr) {
       const parsed = parseInt(sessionIdStr, 10);
@@ -119,7 +170,7 @@ export class ChatController {
     // 创建执行轨迹
     const trace = this.traceService.startTrace(chatId);
 
-    // 保存用户消息到数据库
+    // 异步保存用户消息
     this.chatMessageRepo.save(
       this.chatMessageRepo.create({
         chatId,
@@ -130,7 +181,7 @@ export class ChatController {
       }),
     ).catch(e => console.error('Failed to save user chat message:', e));
 
-    // 递增会话消息计数
+    // 增加会话消息计数
     this.chatSessionService.incrementMessageCount(sessionId).catch(e =>
       console.error('Failed to increment message count:', e));
 
@@ -142,7 +193,7 @@ export class ChatController {
       this.chatSessionService.autoGenerateTitle(sessionId, message);
     }
 
-    // 意图检测 — 计时
+    // 识别显式意图
     const intentStart = Date.now();
     const intent = detectIntent(message);
     trace.addStep('intent_detection', Date.now() - intentStart, {
@@ -157,13 +208,13 @@ export class ChatController {
     // 延迟执行的控制命令队列
     const deferredControls: { command: string; payload?: any }[] = [];
 
-    // 提前获取当前播放状态 (用于意图处理和上下文构建)
+    // 基于当前播放状态执行显式控制
     const currentState = this.playbackState.getState();
 
     if (intent.type) {
       switch (intent.type) {
         case 'next': {
-          // 记录当前歌被切走时的播放位置
+          // 记录切歌前的播放历史
           const beforeContent = currentState.content;
           if (beforeContent) {
             this.playHistoryService.record({
@@ -179,7 +230,7 @@ export class ChatController {
             }).catch(e => console.error('Failed to record play history:', e));
           }
           this.playbackState.nextTrack();
-          // 记录切到的新歌
+          // 记录切歌后的播放历史
           const nextContent = this.playbackState.getState().content;
           if (nextContent) {
             this.playHistoryService.record({
@@ -194,7 +245,7 @@ export class ChatController {
             }).catch(e => console.error('Failed to record play history:', e));
           }
           deferredControls.push({ command: 'next' });
-          actionContext = '[系统指令: 用户要求切换下一首歌，已执行切歌操作。]';
+          actionContext = '[系统动作: 已切到下一首并更新播放状态]';
           break;
         }
 
@@ -228,47 +279,39 @@ export class ChatController {
             }).catch(e => console.error('Failed to record play history:', e));
           }
           deferredControls.push({ command: 'prev' });
-          actionContext = '[系统指令: 用户要求播放上一首歌，已执行回退操作。]';
+          actionContext = '[系统动作: 已切回上一首并更新播放状态]';
           break;
         }
 
         case 'pause':
           this.playbackState.setPaused();
           deferredControls.push({ command: 'pause' });
-          actionContext = '[系统指令: 用户要求暂停播放，已暂停。]';
+          actionContext = '[系统动作: 已暂停当前播放]';
           break;
 
         case 'play':
           this.playbackState.updateState({ action: 'play' });
           deferredControls.push({ command: 'play' });
-          actionContext = '[系统指令: 用户要求继续播放，已恢复播放。]';
+          actionContext = '[系统动作: 已继续当前播放]';
           break;
 
         case 'add_song':
           if (intent.params?.keyword) {
             const searchStart = Date.now();
             try {
-              const searchResult: any = await this.musicService.searchMusic(intent.params.keyword, 5);
-              const songs = (searchResult?.songs || []).slice(0, 3);
-              trace.addStep('music_search', Date.now() - searchStart, {
+              const target = this.buildSearchTarget(intent.params.keyword);
+              const rankedSongs = await this.searchSongsForTarget(target, trace, 'music_search', {
                 keyword: intent.params.keyword,
-                resultCount: songs.length,
+                source: 'add_song',
               });
-              const newTracks = songs.map((song: any) => ({
-                type: 'song' as const,
-                id: song.id.toString(),
-                name: song.name,
-                title: song.name,
-                artist: song.ar?.map((a: any) => a.name).join(' / ') || '',
-                album: song.al?.name || '',
-                duration: song.dt ? Math.floor(song.dt / 1000) : 0,
-                coverUrl: song.al?.picUrl || '',
-                cover: song.al?.picUrl || '',
-                url: `/audio/${song.id}`,
-              }));
+              const pickedSongs = rankedSongs.slice(0, target.title && target.artist ? 1 : 3);
+              const newTracks = pickedSongs.map((song: any) => this.toQueueTrack(song));
+              if (newTracks.length === 0) {
+                throw new Error('No matching songs found');
+              }
               this.playbackState.addToPlaylist(newTracks);
               recommendedSongs = newTracks;
-              // 记录播放历史
+              // 记录入队歌曲
               for (const track of newTracks) {
                 this.playHistoryService.record({
                   songId: track.id,
@@ -287,10 +330,10 @@ export class ChatController {
                 playlist: this.playbackState.getPlaylist(),
               });
               const songList = newTracks.map((t: any) => `《${t.name}》-${t.artist}`).join('、');
-              actionContext = `[系统指令: 用户想听${intent.params.keyword}的歌，已搜索并添加以下歌曲到播放列表: ${songList}。]`;
+              actionContext = `[系统动作: 已搜索“${intent.params.keyword}”并加入播放列表: ${songList}]`;
             } catch {
               trace.addStep('music_search', Date.now() - searchStart, undefined, 'error', 'Search failed');
-              actionContext = `[系统指令: 用户想听${intent.params.keyword}的歌，但搜索失败了。]`;
+              actionContext = `[系统动作: 搜索“${intent.params.keyword}”失败，未能加入播放列表]`;
             }
           }
           break;
@@ -299,24 +342,18 @@ export class ChatController {
           if (intent.params?.keyword) {
             const searchStart = Date.now();
             try {
-              const searchResult: any = await this.musicService.searchMusic(intent.params.keyword, 5);
-              const songs = (searchResult?.songs || []).slice(0, 5);
-              trace.addStep('music_search', Date.now() - searchStart, {
+              const target = this.buildSearchTarget(intent.params.keyword);
+              const rankedSongs = await this.searchSongsForTarget(target, trace, 'music_search', {
                 keyword: intent.params.keyword,
-                resultCount: songs.length,
+                source: 'search_song',
               });
-              searchResults = songs.map((song: any) => ({
-                id: song.id.toString(),
-                name: song.name,
-                artist: song.ar?.map((a: any) => a.name).join(' / ') || '',
-                cover: song.al?.picUrl || '',
-                url: `/audio/${song.id}`,
-              }));
+              const pickedSongs = rankedSongs.slice(0, target.title && target.artist ? 3 : 5);
+              searchResults = pickedSongs.map((song: any) => this.toSearchCard(song));
               const songList = searchResults.map((t: any) => `《${t.name}》-${t.artist}`).join('、');
-              actionContext = `[系统指令: 用户想听${intent.params.keyword}的歌，已搜索到以下歌曲，请推荐给用户选择: ${songList}。]`;
+              actionContext = `[系统动作: 已搜索“${intent.params.keyword}”，找到以下候选歌曲: ${songList}]`;
             } catch {
               trace.addStep('music_search', Date.now() - searchStart, undefined, 'error', 'Search failed');
-              actionContext = `[系统指令: 用户想听${intent.params.keyword}的歌，但搜索失败了，请告知用户操作失败。]`;
+              actionContext = `[系统动作: 搜索“${intent.params.keyword}”失败，未找到可展示的候选歌曲]`;
             }
           }
           break;
@@ -340,10 +377,10 @@ export class ChatController {
               playlist: this.playbackState.getPlaylist(),
             });
             const target = intent.params?.songName || `第${intent.params?.index}首`;
-            actionContext = `[系统指令: 用户要求删除${target}，已从播放列表移除。]`;
+            actionContext = `[系统动作: 已从播放列表移除${target}]`;
           } else {
             const target = intent.params?.songName || `第${intent.params?.index}首`;
-            actionContext = `[系统指令: 用户要求删除${target}，但未找到该歌曲。]`;
+            actionContext = `[系统动作: 未能从播放列表移除${target}]`;
           }
           break;
         }
@@ -358,7 +395,7 @@ export class ChatController {
             command: 'volume',
             payload: { volume: targetVol / 100 },
           });
-          actionContext = `[系统指令: 用户调整音量，当前音量${targetVol}%。]`;
+          actionContext = `[系统动作: 已将音量调整到${targetVol}%]`;
           break;
         }
       }
@@ -372,27 +409,27 @@ export class ChatController {
       });
     }
 
-    // 获取当前播放状态作为上下文
+    // 读取当前播放信息
     const currentContent = currentState.content;
-    // C: 丰富播放上下文 — 歌名+歌手+专辑，而非仅歌名
+    // 将当前播放格式化为模型可读文本
     const currentTrack = currentContent
       ? `${currentContent.title}${currentContent.artist ? ' - ' + currentContent.artist : ''}${currentContent.album ? ' (' + currentContent.album + ')' : ''}`
       : '无';
 
-    // C: 构造播放列表摘要（当前播放位置前后各2首）
+    // 构造播放列表摘要，展示当前歌曲前后各两首
     const playlist = currentState.playlist;
     const curIdx = currentState.currentIndex;
     const playlistSummary = playlist.length > 0
       ? playlist.slice(Math.max(0, curIdx - 2), Math.min(playlist.length, curIdx + 4))
           .map((t, i) => {
             const globalIdx = Math.max(0, curIdx - 2) + i;
-            const marker = globalIdx === curIdx ? '▶' : '  ';
+            const marker = globalIdx === curIdx ? '?' : '  ';
             return `${marker} [${globalIdx + 1}] ${t.title}${t.artist ? ' - ' + t.artist : ''}`;
           })
           .join('\n')
       : '空';
 
-    // C: 最近播放历史 — 从 PlayHistory 持久化表查询 (取代内存 playlist 索引)
+    // 查询最近播放历史，直接读取 PlayHistory 持久化记录
     const recentPlayed = await this.playHistoryService.getRecentFormatted(5);
 
     try {
@@ -411,7 +448,7 @@ export class ChatController {
         ? `[当前时段: ${currentSlot.label}, ${currentSlot.mood}, 推荐曲风: ${currentSlot.genres.join('、')}]`
         : '';
 
-      // 获取近期对话历史（最近20条）
+      // 获取近期对话历史（最近 20 条）
       const historyStart = Date.now();
       const recentHistory = await this.chatMessageRepo.find({
         order: { createdAt: 'DESC' },
@@ -420,21 +457,21 @@ export class ChatController {
       recentHistory.reverse(); // 按时间正序
       trace.addStep('load_history', Date.now() - historyStart, { count: recentHistory.length });
 
-      // F: assistant 历史消息附加推荐歌曲信息，让 LLM 知道之前推荐了什么
-      // F+: 串场消息也附加上下文，让 LLM 知道之前做了什么串场介绍
+      // 给 DJ 历史消息补充推荐歌曲信息，让模型知道之前推荐过什么
+      // 给串场消息补充上下文，让模型知道之前说过哪些串场介绍
       const historyMessages = recentHistory.map(m => {
         const role = m.role === 'dj' ? 'assistant' : 'user';
         let content = m.content;
 
-        // 如果是 DJ 的回复且有推荐歌曲，附加到 content 末尾
+        // 如果是 DJ 回复且包含推荐歌曲，则在末尾补充系统记录
         if (role === 'assistant' && m.metadata && m.metadata.recommendedSongs && m.metadata.recommendedSongs.length > 0) {
           const songInfo = m.metadata.recommendedSongs
             .map((s: any) => `${s.name || s.title}${s.artist ? ' - ' + s.artist : ''}`)
             .join(', ');
-          content = `${content} [推荐: ${songInfo}]`;
+          content = `${content}\n[系统记录: 已推荐 ${songInfo}]`;
         }
 
-        // 如果是串场/推荐消息，附加串场类型和歌曲信息
+        // 如果是串场或推荐消息，则补充串场类型和目标歌曲信息
         if (role === 'assistant' && m.metadata && m.metadata.segueType) {
           const segueInfo = m.metadata.songTitle
             ? `${m.metadata.artist ? m.metadata.artist + '的' : ''}《${m.metadata.songTitle}》`
@@ -448,8 +485,8 @@ export class ChatController {
         return { role, content };
       });
 
-      // P0-2: 系统级上下文（时段、播放状态、已执行操作）作为独立参数传递
-      // C: 丰富上下文信息 — 当前播放含歌手+专辑、播放列表摘要、最近播放
+      // 将系统级上下文（时段、播放状态、已执行操作）作为独立参数传递
+      // 补充上下文信息：当前播放、播放列表摘要和最近播放记录
       // 用户消息保持纯净，不含系统指令或元信息
       const systemContextParts: string[] = [];
       if (schedulerContext) systemContextParts.push(schedulerContext);
@@ -460,7 +497,7 @@ export class ChatController {
       if (actionContext) systemContextParts.push(actionContext);
       const systemContext = systemContextParts.join('\n');
 
-      // 调用 LLM 生成结构化回复 — 使用 Function Calling (P1-1)，计时
+      // 调用 LLM 生成结构化回复，使用 Function Calling，并记录耗时
       const llmStart = Date.now();
       const structured = await this.llmService.chatStructuredWithFC(
         [...historyMessages, { role: 'user', content: message }],
@@ -473,10 +510,14 @@ export class ChatController {
         action: structured?.action,
       });
 
-      if (structured) {
-        const djText = structured.say;
+      // 文本流任务在 if 代码块内创建，在外部统一等待完成
+      let textStreamPromise: Promise<void> | null = null;
 
-        // 保存 DJ 回复到数据库（含推荐歌曲、搜索结果和执行轨迹）
+      if (structured) {
+        // 兜底处理：如果模型没有返回文案但给出了推荐歌曲，则补一条默认回复
+        const djText = structured.say || (structured.play?.length > 0 ? '为你选了一首歌，听听看。' : '');
+
+        // 先写入骨架消息，推荐歌曲与搜索结果在后续搜索完成后回填
         const traceSteps = trace.getSteps();
         this.chatMessageRepo.save(
           this.chatMessageRepo.create({
@@ -485,15 +526,14 @@ export class ChatController {
             content: djText,
             sessionId,
             metadata: {
-              recommendedSongs: recommendedSongs.length > 0 ? recommendedSongs : undefined,
-              searchResults: searchResults.length > 0 ? searchResults : undefined,
+              source: 'chat',
               structuredReason: structured.reason || undefined,
               executionTrace: traceSteps,
             },
           }),
         ).catch(e => console.error('Failed to save DJ chat message:', e));
 
-        // LLM 结构化输出中的 action（补充 regex 未覆盖的意图）
+        // 处理模型返回的 action，补足正则意图识别未覆盖的情况
         if (structured.action && deferredControls.length === 0) {
           switch (structured.action) {
             case 'next':
@@ -515,9 +555,9 @@ export class ChatController {
           }
         }
 
-        // P1-2: 处理 LLM 指定的推荐歌曲（play[] 字段）— 带搜索反馈环
+        // 处理模型指定的推荐歌曲，并在搜索失败时进行一次反馈修正
         if (structured.play.length > 0 && recommendedSongs.length === 0) {
-          // 构建搜索任务列表（最多3首）
+          // 构建搜索任务列表（最多 3 首）
           const searchItems: { keyword: string; title?: string; artist?: string }[] =
             structured.play.slice(0, 3).map(item => ({
               keyword: item.keyword || item.title || '',
@@ -525,10 +565,10 @@ export class ChatController {
               artist: item.artist || undefined,
             })).filter(item => item.keyword);
 
-          // 第一轮搜索
+          // 执行第一轮搜索
           const round1Results = await this.executeSearchRound(searchItems, trace, chatId);
 
-          // 收集失败的搜索任务
+          // 收集搜索失败的任务
           const failedItems: { keyword: string; title?: string; artist?: string }[] = [];
           const failedResults: { keyword: string; results: string }[] = [];
           for (let i = 0; i < searchItems.length; i++) {
@@ -543,7 +583,7 @@ export class ChatController {
             }
           }
 
-          // 反馈环：如果有失败的关键词，让 LLM 修正后重试（最多1轮）
+          // 如果有失败关键词，让模型修正后再重试一轮
           if (failedItems.length > 0) {
             const feedbackStart = Date.now();
             trace.addStep('search_feedback', Date.now() - feedbackStart, {
@@ -557,7 +597,7 @@ export class ChatController {
               refinedKeywords: refined.map(r => r.keyword),
             });
 
-            // 第二轮搜索：用修正后的关键词
+            // 第二轮搜索：使用修正后的关键词
             const round2Results = await this.executeSearchRound(
               refined.slice(0, failedItems.length),
               trace,
@@ -580,8 +620,8 @@ export class ChatController {
           }
         }
 
-        // Fallback: LLM 没有返回 play 但用户明显想听某歌手的歌
-        // 从用户消息中提取歌手名，搜索该歌手的热门歌曲
+        // 兜底处理：如果模型没有返回 play，但用户明显是在点某位歌手的歌
+        // 从用户消息中提取歌手名，再搜索该歌手的歌曲
         if (structured.play.length === 0 && recommendedSongs.length === 0) {
           const artistMatch = message.match(/(?:推荐|来|放|听|想听|有没有)\s*(?:几首|几|一些)?\s*([^，。！？\s]{1,10})\s*(?:的|的歌|的音乐|的歌曲|的歌听)/);
           if (artistMatch && artistMatch[1]) {
@@ -594,7 +634,7 @@ export class ChatController {
                 artist: artistName,
                 resultCount: songs.length,
               });
-              // 过滤：只取该歌手原唱的歌曲
+              // 过滤：只保留该歌手的原唱歌曲
               const artistSongs = songs.filter((s: any) =>
                 s.ar?.some((a: any) => a.name?.includes(artistName) || artistName.includes(a.name))
               ).slice(0, 2);
@@ -613,7 +653,17 @@ export class ChatController {
           }
         }
 
-        // === LLM+TTS 并行管线 ===
+        await this.persistDjMessage(
+          chatId,
+          sessionId,
+          djText,
+          structured.reason || undefined,
+          trace.getSteps(),
+          recommendedSongs,
+          searchResults,
+        ).catch(e => console.error('Failed to persist DJ chat message:', e));
+
+        // === LLM 与 TTS 并行管线 ===
         const vol = typeof clientVolume === 'number' ? clientVolume : 0.5;
         const ttsVolume = `${Math.round((vol - 0.5) * 100)}%`;
 
@@ -621,8 +671,8 @@ export class ChatController {
         const sentences = djText.split(/(?<=[。！？；\n])/g).filter(s => s.trim().length > 0);
         if (sentences.length === 0) sentences.push(djText);
 
-        // 流式推送文本 — 分句发送，每句延迟 150ms 模拟自然语速
-        (async () => {
+        // 流式推送文本：分句发送，每句延迟 150ms 模拟自然语速
+        textStreamPromise = (async () => {
           await new Promise((r) => setTimeout(r, 600));
           for (let si = 0; si < sentences.length; si++) {
             const sentence = sentences[si];
@@ -649,7 +699,7 @@ export class ChatController {
           }
         })();
 
-        // TTS 并行合成 + 失败兜底 — 整体计时
+        // TTS 并行合成，失败时自动兜底，并记录总耗时
         const ttsStart = Date.now();
         const ttsSuccessFlags = new Array(sentences.length).fill(false);
         const ttsPromise = (async () => {
@@ -658,7 +708,7 @@ export class ChatController {
               this.ttsService.synthesizeStream({
                 text: sentence,
                 voice: this.ttsService.defaultVoice,
-                rate: '+0%',
+                rate: '+10%',
                 pitch: '-5Hz',
                 volume: ttsVolume,
               })
@@ -680,11 +730,11 @@ export class ChatController {
                 })
                 .catch(e => {
                   console.error(`TTS sentence ${si} failed:`, e);
-                  // 兜底：单句流式失败 → 尝试非流式合成
+                  // 兜底：单句流式合成失败后，尝试非流式合成
                   return this.ttsService.synthesize({
                     text: sentence,
                     voice: this.ttsService.defaultVoice,
-                    rate: '+0%',
+                    rate: '+10%',
                     pitch: '-5Hz',
                     volume: ttsVolume,
                   }).then(buf => {
@@ -702,7 +752,7 @@ export class ChatController {
           return sentenceResults;
         })();
 
-        // 先发推荐歌曲和搜索结果（不等 TTS 完成，减少延迟感知）
+        // 先发送推荐歌曲和搜索结果，不等待 TTS 完成，以减少感知延迟
         await new Promise((r) => setTimeout(r, 600));
 
         if (recommendedSongs.length > 0) {
@@ -712,6 +762,7 @@ export class ChatController {
             done: false,
             metadata: {
               chatId,
+              source: 'chat',
               recommendedSongs: recommendedSongs.map(s => ({
                 id: s.id,
                 name: s.name,
@@ -730,6 +781,7 @@ export class ChatController {
             done: false,
             metadata: {
               chatId,
+              source: 'chat',
               searchResults,
             },
           });
@@ -760,7 +812,7 @@ export class ChatController {
           });
         }
 
-        // 延迟 1.5s 执行控制指令
+        // 延迟 1.5 秒执行控制指令
         if (deferredControls.length > 0) {
           setTimeout(() => {
             for (const ctrl of deferredControls) {
@@ -773,7 +825,12 @@ export class ChatController {
       // 保存执行轨迹到数据库
       await trace.finish(structured ? 'ok' : 'partial');
 
-      // 广播轨迹事件给前端 (可选，用于调试)
+      // 等待文本流也完成，避免 chat-end 早于文本流到达前端
+      if (textStreamPromise) {
+        await textStreamPromise.catch(() => {});
+      }
+
+      // 向前端广播执行轨迹事件，可用于调试
       this.chatGateway.broadcastTrace({
         chatId,
         step: 'complete',
@@ -781,7 +838,7 @@ export class ChatController {
         status: 'ok',
       });
 
-      // 发送结束标记（chat-stream done + chat-end 双重保险）
+      // 发送结束标记，使用 chat-stream done 和 chat-end 双重保险
       this.chatGateway.broadcastChatStream({ role: 'dj', delta: '', done: true });
       this.chatGateway.broadcastChatEnd({ id: chatId });
 
@@ -818,17 +875,7 @@ export class ChatController {
       take,
     });
     messages.reverse();
-    return messages.map(m => ({
-      id: `msg_${m.id}`,
-      role: m.role,
-      content: m.content,
-      timestamp: m.createdAt.getTime(),
-      sessionId: m.sessionId,
-      recommendedSongs: m.metadata?.recommendedSongs || undefined,
-      searchResults: m.metadata?.searchResults || undefined,
-      segueType: m.metadata?.segueType || undefined,
-      executionTrace: m.metadata?.executionTrace || undefined,
-    }));
+    return messages.map((m) => this.serializeChatMessage(m));
   }
 
   @Get('play-history')
@@ -877,7 +924,207 @@ export class ChatController {
     return { status: 'success' };
   }
 
-  // P1-2: 搜索反馈环 — 执行一轮搜索，返回每首歌的搜索结果
+  private buildSearchTarget(keyword: string, title?: string, artist?: string) {
+    const target = {
+      keyword: keyword.trim(),
+      title: title?.trim() || undefined,
+      artist: artist?.trim() || undefined,
+    };
+
+    if ((!target.title || !target.artist) && target.keyword.includes('的')) {
+      const parts = target.keyword.split('的');
+      const maybeArtist = parts[0]?.trim();
+      const maybeTitle = parts.slice(1).join('的').trim();
+      if (!target.artist && maybeArtist) target.artist = maybeArtist;
+      if (!target.title && maybeTitle) target.title = maybeTitle;
+    }
+
+    if (target.artist) {
+      target.artist = target.artist.replace(/^by\s+/i, '').replace(/的+$/g, '').trim() || undefined;
+    }
+
+    if (target.title) {
+      target.title = target.title.replace(/^[《"]+|[》"]+$/g, '').trim() || undefined;
+    }
+
+    return target;
+  }
+
+  private normalizeSearchText(value?: string): string {
+    return (value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/feat\.?/g, '')
+      .replace(/[\u300a\u300b"'`]/g, '')
+      .replace(/[\s()\uFF08\uFF09\u3010\u3011\[\],\uFF0C\u3002\uFF01\uFF1F!?\uFF1A:\uFF1B;\uFF0F/\\_.-]+/g, '');
+  }
+
+  private normalizeSearchQuery(value?: string): string {
+    return (value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[\u300a\u300b"'`]/g, ' ')
+      .replace(/的/g, ' ')
+      .replace(/[\s()\uFF08\uFF09\u3010\u3011\[\],\uFF0C\u3002\uFF01\uFF1F!?\uFF1A:\uFF1B;\uFF0F/\\_.-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private buildSearchQueries(target: { keyword: string; title?: string; artist?: string }): string[] {
+    const queries: string[] = [];
+    const pushUnique = (value?: string) => {
+      const trimmed = value?.trim();
+      if (!trimmed || trimmed.length > 60 || queries.includes(trimmed)) return;
+      queries.push(trimmed);
+    };
+
+    pushUnique(target.keyword);
+    if (target.title && target.artist) {
+      pushUnique(`${target.title} ${target.artist}`);
+      pushUnique(`${target.artist} ${target.title}`);
+    }
+    if (target.title) pushUnique(target.title);
+    if (target.artist) pushUnique(target.artist);
+
+    const normalizedVariants = queries
+      .map((query) => this.normalizeSearchQuery(query))
+      .filter((query) => query && !queries.includes(query));
+
+    return [...queries, ...normalizedVariants];
+  }
+
+  private scoreSongCandidate(song: any, target: { keyword: string; title?: string; artist?: string }): number {
+    const songTitle = this.normalizeSearchText(song?.name || '');
+    const songArtists = (song?.ar || [])
+      .map((artist: any) => this.normalizeSearchText(artist?.name || ''))
+      .filter(Boolean);
+    const targetTitle = this.normalizeSearchText(target.title);
+    const targetArtist = this.normalizeSearchText(target.artist);
+    const targetKeyword = this.normalizeSearchText(target.keyword);
+
+    let score = 0;
+
+    if (targetTitle) {
+      if (songTitle === targetTitle) score += 120;
+      else if (songTitle.includes(targetTitle) || targetTitle.includes(songTitle)) score += 80;
+      else score -= 60;
+    } else if (targetKeyword && songTitle.includes(targetKeyword)) {
+      score += 40;
+    }
+
+    if (targetArtist) {
+      const exactArtist = songArtists.some((artist: string) => artist === targetArtist);
+      const fuzzyArtist = songArtists.some((artist: string) => artist.includes(targetArtist) || targetArtist.includes(artist));
+      if (exactArtist) score += 140;
+      else if (fuzzyArtist) score += 90;
+      else score -= 180;
+    } else if (targetKeyword) {
+      const keywordArtist = songArtists.some((artist: string) => artist.includes(targetKeyword) || targetKeyword.includes(artist));
+      if (keywordArtist) score += 50;
+    }
+
+    if (targetTitle && targetArtist && songTitle === targetTitle && songArtists.some((artist: string) => artist === targetArtist)) {
+      score += 80;
+    }
+
+    return score;
+  }
+
+  private rankSongsForTarget(songs: any[], target: { keyword: string; title?: string; artist?: string }): any[] {
+    const ranked = songs
+      .map((song) => ({ song, score: this.scoreSongCandidate(song, target) }))
+      .sort((a, b) => b.score - a.score);
+
+    const hasStrongMatch = ranked.some((entry) => entry.score > 0);
+    if (hasStrongMatch) {
+      return ranked.filter((entry) => entry.score > 0).map((entry) => entry.song);
+    }
+
+    if (target.title && target.artist) {
+      return [];
+    }
+
+    return ranked.map((entry) => entry.song);
+  }
+
+  private async searchSongsForTarget(
+    target: { keyword: string; title?: string; artist?: string },
+    trace: ActiveTrace,
+    stepName: string,
+    metadata: Record<string, any>,
+    limit = 10,
+  ): Promise<any[]> {
+    const attempts = [{ target, swapped: false }];
+
+    if (target.title && target.artist) {
+      attempts.push({
+        target: {
+          keyword: `${target.artist} ${target.title}`,
+          title: target.artist,
+          artist: target.title,
+        },
+        swapped: true,
+      });
+    }
+
+    for (const attempt of attempts) {
+      for (const query of this.buildSearchQueries(attempt.target)) {
+        const searchStart = Date.now();
+        try {
+          const searchResult: any = await this.musicService.searchMusic(query, limit);
+          const rankedSongs = this.rankSongsForTarget(searchResult?.songs || [], attempt.target);
+          trace.addStep(stepName, Date.now() - searchStart, {
+            ...metadata,
+            query,
+            swapped: attempt.swapped,
+            targetTitle: attempt.target.title,
+            targetArtist: attempt.target.artist,
+            resultCount: rankedSongs.length,
+            rawResultCount: (searchResult?.songs || []).length,
+          });
+          if (rankedSongs.length > 0) {
+            return rankedSongs;
+          }
+        } catch {
+          trace.addStep(stepName, Date.now() - searchStart, {
+            ...metadata,
+            query,
+            swapped: attempt.swapped,
+          }, 'error', `Search "${query}" failed`);
+        }
+      }
+    }
+
+    return [];
+  }
+
+  private toSearchCard(song: any) {
+    return {
+      id: song.id.toString(),
+      name: song.name,
+      artist: song.ar?.map((artist: any) => artist.name).join(' / ') || '',
+      cover: song.al?.picUrl || '',
+      url: `/audio/${song.id}`,
+    };
+  }
+
+  private toQueueTrack(song: any) {
+    return {
+      type: 'song' as const,
+      id: song.id.toString(),
+      name: song.name,
+      title: song.name,
+      artist: song.ar?.map((artist: any) => artist.name).join(' / ') || '',
+      album: song.al?.name || '',
+      duration: song.dt ? Math.floor(song.dt / 1000) : 0,
+      coverUrl: song.al?.picUrl || '',
+      cover: song.al?.picUrl || '',
+      url: `/audio/${song.id}`,
+    };
+  }
+
+  // 执行一轮搜索反馈，返回每首歌对应的搜索结果
   private async executeSearchRound(
     items: { keyword: string; title?: string; artist?: string }[],
     trace: any,
@@ -889,40 +1136,15 @@ export class ChatController {
       const kw = item.keyword;
       if (!kw) { results.push(null); continue; }
 
-      // 多策略搜索：先原文 → 再 歌名+歌手 → 最后纯歌名
-      const searchQueries: string[] = [kw];
-      if (item.title && item.artist) searchQueries.push(`${item.title} ${item.artist}`);
-      if (item.title) searchQueries.push(item.title);
-
       let found: { id: string; name: string; artist: string; cover: string; url: string } | null = null;
-      for (const query of searchQueries) {
-        if (found || !query || query.length > 50) continue;
-        const searchStart = Date.now();
-        try {
-          const result: any = await this.musicService.searchMusic(query, 3);
-          const songs = result?.songs || [];
-          trace.addStep('music_search_recommend', Date.now() - searchStart, {
-            query,
-            resultCount: songs.length,
-            round: 'round1',
-          });
-          // 优先匹配歌名最接近的结果
-          const title = item.title || '';
-          const best = title
-            ? songs.find((s: any) => s.name?.toLowerCase().includes(title.toLowerCase())) || songs[0]
-            : songs[0];
-          if (best) {
-            found = {
-              id: best.id.toString(),
-              name: best.name,
-              artist: best.ar?.map((a: any) => a.name).join(' / ') || '',
-              cover: best.al?.picUrl || '',
-              url: `/audio/${best.id}`,
-            };
-          }
-        } catch {
-          trace.addStep('music_search_recommend', Date.now() - searchStart, undefined, 'error', `Search "${query}" failed`);
-        }
+      const target = this.buildSearchTarget(kw, item.title, item.artist);
+      const songs = await this.searchSongsForTarget(target, trace, 'music_search_recommend', {
+        keyword: kw,
+        round: 'round1',
+      });
+      const best = songs[0];
+      if (best) {
+        found = this.toSearchCard(best);
       }
       results.push(found);
     }
@@ -930,7 +1152,7 @@ export class ChatController {
     return results;
   }
 
-  // 记录推荐歌曲到播放历史
+  // 记录推荐歌曲播放历史
   private async recordRecommendedSong(song: { id: string; name: string; artist: string; cover: string; url: string }, chatId: string) {
     this.playHistoryService.record({
       songId: song.id,
@@ -944,3 +1166,12 @@ export class ChatController {
     }).catch(e => console.error('Failed to record play history:', e));
   }
 }
+
+
+
+
+
+
+
+
+

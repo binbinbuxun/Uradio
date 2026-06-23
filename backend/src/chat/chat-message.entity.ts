@@ -1,4 +1,4 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index } from 'typeorm';
+﻿import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, Index } from 'typeorm';
 
 @Entity()
 @Index('idx_chat_message_created_at', ['createdAt'])
@@ -23,6 +23,7 @@ export class ChatMessage {
 
   @Column({ type: 'simple-json', nullable: true })
   metadata: {
+    source?: 'chat' | 'radio_auto';
     recommendedSongs?: any[];
     searchResults?: any[];
     structuredReason?: string;
