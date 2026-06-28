@@ -22,11 +22,65 @@ export interface ChatSession {
   updatedAt: string;
 }
 
+export type RadioMode = 'manual' | 'auto';
+export type QueueInsertMode = 'play_now' | 'play_next' | 'append';
+export interface PlayHistoryItem {
+  id: number;
+  songId: string;
+  title: string;
+  artist: string;
+  album: string;
+  coverUrl: string;
+  duration: number;
+  trigger: string;
+  playedAt: string;
+  chatId: string | null;
+  position: number;
+}
+
+export interface QueueTrack {
+  id: string;
+  queueItemId?: string;
+  name: string;
+  title?: string;
+  artist: string;
+  cover?: string;
+  coverUrl?: string;
+  url: string;
+  source?: string;
+  reason?: string;
+  status?: string;
+  insertPolicy?: string;
+}
+
+export interface QueueCandidate extends QueueTrack {
+  candidateId: string;
+  source: 'chat' | 'radio_auto' | 'search';
+  createdAt?: number;
+}
+
+export interface BootstrapInfo {
+  source: string;
+  label: string;
+  reservoirCount: number;
+  initializedAt: number;
+}
+
 export interface QueueState {
-  playlist: { id: string; name: string; artist: string; cover?: string; url: string }[];
+  queueId?: string;
+  version?: number;
+  playlist: QueueTrack[];
+  upNext?: QueueTrack[];
   currentIndex: number;
   action: string;
   currentTrackId?: string | null;
+  bootstrap?: BootstrapInfo | null;
+  candidates?: {
+    chat: QueueCandidate[];
+    radio: QueueCandidate[];
+    search: QueueCandidate[];
+  };
+  historyCount?: number;
 }
 
 export const api = {
@@ -102,6 +156,108 @@ export const api = {
       return res.json();
     } catch (error) {
       console.error('Add queue track failed:', error);
+      return { status: 'error', message: '网络错误' };
+    }
+  },
+
+  queueCommand: async (
+    payload: {
+      command: QueueInsertMode | 'remove' | 'clear_upcoming' | 'accept_candidate' | 'reject_candidate';
+      track?: any;
+      tracks?: any[];
+      candidateId?: string;
+      index?: number;
+      fromIndex?: number;
+      toIndex?: number;
+      source?: 'manual' | 'chat' | 'radio_auto';
+      mode?: QueueInsertMode;
+    },
+  ): Promise<{ status: string; queue?: QueueState; message?: string }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/queue/commands`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      return res.json();
+    } catch (error) {
+      console.error('Queue command failed:', error);
+      return { status: 'error', message: '网络错误' };
+    }
+  },
+
+  acceptCandidate: async (
+    candidateId: string,
+    mode: QueueInsertMode,
+  ): Promise<{ status: string; queue?: QueueState; message?: string }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/candidates/${candidateId}/accept`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      return res.json();
+    } catch (error) {
+      console.error('Accept candidate failed:', error);
+      return { status: 'error', message: '网络错误' };
+    }
+  },
+
+  rejectCandidate: async (
+    candidateId: string,
+  ): Promise<{ status: string; queue?: QueueState; message?: string }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/candidates/${candidateId}/reject`, {
+        method: 'POST',
+      });
+      return res.json();
+    } catch (error) {
+      console.error('Reject candidate failed:', error);
+      return { status: 'error', message: '网络错误' };
+    }
+  },
+
+  removeQueueTrack: async (
+    index: number,
+  ): Promise<{ status: string; queue?: QueueState; message?: string }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/queue/remove`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ index }),
+      });
+      return res.json();
+    } catch (error) {
+      console.error('Remove queue track failed:', error);
+      return { status: 'error', message: '网络错误' };
+    }
+  },
+
+  clearUpcoming: async (): Promise<{ status: string; queue?: QueueState; message?: string }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/queue/clear-upcoming`, {
+        method: 'POST',
+      });
+      return res.json();
+    } catch (error) {
+      console.error('Clear upcoming failed:', error);
+      return { status: 'error', message: '网络错误' };
+    }
+  },
+
+  moveQueueTrack: async (
+    fromIndex: number,
+    toIndex: number,
+  ): Promise<{ status: string; queue?: QueueState; message?: string }> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/queue/commands`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: 'move', fromIndex, toIndex, source: 'manual' }),
+      });
+      return res.json();
+    } catch (error) {
+      console.error('Move queue track failed:', error);
       return { status: 'error', message: '网络错误' };
     }
   },
@@ -225,6 +381,16 @@ export const api = {
     } catch (error) {
       console.error('Clear chat history failed:', error);
       return false;
+    }
+  },
+
+  getPlayHistory: async (limit = 50, hours = 72): Promise<PlayHistoryItem[]> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/play-history?limit=${limit}&hours=${hours}`);
+      return res.json();
+    } catch (error) {
+      console.error('Get play history failed:', error);
+      return [];
     }
   },
 

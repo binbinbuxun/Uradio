@@ -1,5 +1,6 @@
 ﻿import { useState, useEffect, useRef } from 'react';
 import { api, connectStream } from '../api';
+import type { QueueInsertMode } from '../api';
 
 type ChatUiMessage = {
   id: string;
@@ -28,7 +29,11 @@ interface ChatState {
   handleSendMessage: () => Promise<void>;
   handleClearHistory: () => Promise<void>;
   handleLoadSession: (sessionId: number) => Promise<void>;
-  handleAddTrack: (song: any) => void;
+  handleAddTrack: (song: any, mode?: QueueInsertMode) => void;
+  handleRejectCandidate: (candidateId: string) => void;
+  handleRemoveQueueTrack: (index: number) => void;
+  handleClearUpcoming: () => void;
+  handleMoveQueueTrack: (fromIndex: number, toIndex: number) => void;
   handleQueueSelect: (index: number) => void;
 }
 
@@ -39,9 +44,8 @@ export function useChat(
   ttsChunksRef: React.RefObject<Map<number, string[]>>,
   ttsAudioRef: React.RefObject<HTMLAudioElement | null>,
   _playlist: any[],
-  currentIndex: number,
-  setPlaylist: React.Dispatch<React.SetStateAction<any[]>>,
-  setCurrentIndex: React.Dispatch<React.SetStateAction<number>>,
+  _currentIndex: number,
+  applyQueueState: (queue?: any) => void,
   setIsPlaying: React.Dispatch<React.SetStateAction<boolean>>,
   crossfadeNext: () => void,
   crossfadePrev: () => void,
@@ -60,22 +64,15 @@ export function useChat(
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const djStreamClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const skipHistoryLoadRef = useRef(false); // 新建对话时跳过自动加载
+  const lastEnvelopeSeqRef = useRef(0);
+  const ttsDuckedGainRef = useRef<number | null>(null);
 
-  const mapQueueTrack = (item: any) => ({
-    ...item,
-    id: item.id?.toString?.() || item.id,
-    name: item.name || item.title || '',
-    url: item.url?.startsWith('http') ? item.url : 'http://localhost:3000' + item.url,
-  });
-
-  const applyQueueState = (queue?: { playlist?: any[]; currentIndex?: number }) => {
-    if (!queue) return;
-    if (Array.isArray(queue.playlist)) {
-      setPlaylist(queue.playlist.map(mapQueueTrack));
-    }
-    if (typeof queue.currentIndex === 'number') {
-      setCurrentIndex(queue.currentIndex);
-    }
+  const restoreProgramGain = () => {
+    const gainNode = gainNodeRef.current;
+    if (!gainNode) return;
+    const fallback = volume * volume;
+    gainNode.gain.value = ttsDuckedGainRef.current ?? fallback;
+    ttsDuckedGainRef.current = null;
   };
   // Auto-scroll chat
   useEffect(() => {
@@ -128,6 +125,14 @@ export function useChat(
   // WebSocket
   useEffect(() => {
     const ws = connectStream((msg) => {
+      const envelopeSeq = msg.data?.seq;
+      if (typeof envelopeSeq === 'number') {
+        if (envelopeSeq <= lastEnvelopeSeqRef.current) {
+          return;
+        }
+        lastEnvelopeSeqRef.current = envelopeSeq;
+      }
+
       if (msg.type === 'chat-stream') {
         const payload = msg.data?.data || msg.data;
         const binary = msg.binary as ArrayBuffer | undefined;
@@ -198,6 +203,7 @@ export function useChat(
           if (ttsAudioRef.current) {
             ttsAudioRef.current.pause();
             ttsAudioRef.current = null;
+            restoreProgramGain();
           }
 
           if (metadata.ttsFailed) {
@@ -225,7 +231,10 @@ export function useChat(
 
           const gainNode = gainNodeRef.current;
           const currentVol = volume;
-          if (gainNode) gainNode.gain.value = currentVol * currentVol * 0.2;
+          if (gainNode) {
+            ttsDuckedGainRef.current = gainNode.gain.value;
+            gainNode.gain.value = currentVol * currentVol * 0.2;
+          }
 
           try {
             const totalLength = orderedChunks.reduce((sum, c) => sum + atob(c).length, 0);
@@ -241,22 +250,22 @@ export function useChat(
             ttsAudioRef.current = ttsAudio;
 
             ttsAudio.onended = () => {
-              if (gainNode) gainNode.gain.value = currentVol * currentVol;
+              restoreProgramGain();
               URL.revokeObjectURL(url);
               ttsAudioRef.current = null;
             };
             ttsAudio.onerror = () => {
-              if (gainNode) gainNode.gain.value = currentVol * currentVol;
+              restoreProgramGain();
               URL.revokeObjectURL(url);
               ttsAudioRef.current = null;
             };
             ttsAudio.play().catch(() => {
-              if (gainNode) gainNode.gain.value = currentVol * currentVol;
+              restoreProgramGain();
               URL.revokeObjectURL(url);
               ttsAudioRef.current = null;
             });
           } catch {
-            if (gainNode) gainNode.gain.value = currentVol * currentVol;
+            restoreProgramGain();
           }
         }
 
@@ -381,12 +390,7 @@ export function useChat(
 
       if (msg.type === 'playlist-update') {
         const payload = msg.data?.data || msg.data;
-        if (payload.playlist) {
-          setPlaylist(payload.playlist.map(mapQueueTrack));
-        }
-        if (typeof payload.currentIndex === 'number') {
-          setCurrentIndex(payload.currentIndex);
-        }
+        applyQueueState(payload.queue || payload);
       }
     }, setWsConnected);
 
@@ -451,22 +455,60 @@ export function useChat(
     setIsHistoryOpen(false);
   };
 
-  const handleAddTrack = (song: any) => {
-    api.addQueueTrack({
-      track: {
-        id: song.id,
-        name: song.name,
-        artist: song.artist,
-        cover: song.cover,
-        url: song.url,
-      },
-      insertAt: currentIndex + 1,
-      playNow: true,
-      source: 'manual',
-    }).then((result) => {
+  const handleAddTrack = (song: any, mode: QueueInsertMode = 'play_now') => {
+    const request = song.candidateId
+      ? api.acceptCandidate(song.candidateId, mode)
+      : api.queueCommand({
+        command: mode,
+        track: {
+          id: song.id,
+          name: song.name,
+          artist: song.artist,
+          cover: song.cover,
+          url: song.url,
+        },
+        source: 'manual',
+      });
+
+    request.then((result) => {
       if (result.queue) {
         applyQueueState(result.queue);
-        setIsPlaying(true);
+        if (mode === 'play_now') setIsPlaying(true);
+      } else if (result.status === 'error') {
+        setErrorToast(result.message || '加歌失败');
+        setTimeout(() => setErrorToast(null), 2500);
+      }
+    }).catch(console.error);
+  };
+
+  const handleRejectCandidate = (candidateId: string) => {
+    api.rejectCandidate(candidateId).then((result) => {
+      if (result.queue) {
+        applyQueueState(result.queue);
+      }
+    }).catch(console.error);
+  };
+
+  const handleRemoveQueueTrack = (index: number) => {
+    api.removeQueueTrack(index).then((result) => {
+      if (result.queue) {
+        applyQueueState(result.queue);
+      }
+    }).catch(console.error);
+  };
+
+  const handleClearUpcoming = () => {
+    api.clearUpcoming().then((result) => {
+      if (result.queue) {
+        applyQueueState(result.queue);
+      }
+    }).catch(console.error);
+  };
+
+  const handleMoveQueueTrack = (fromIndex: number, toIndex: number) => {
+    api.moveQueueTrack(fromIndex, toIndex).then((result) => {
+      if (result.queue) {
+        applyQueueState(result.queue);
       }
     }).catch(console.error);
   };
@@ -496,6 +538,10 @@ export function useChat(
     handleClearHistory,
     handleLoadSession,
     handleAddTrack,
+    handleRejectCandidate,
+    handleRemoveQueueTrack,
+    handleClearUpcoming,
+    handleMoveQueueTrack,
     handleQueueSelect,
   };
 }

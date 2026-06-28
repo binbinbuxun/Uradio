@@ -153,9 +153,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   broadcastTtsChunk(chatId: string, sentenceIndex: number, sentenceCount: number, audioBuffer: Buffer) {
+    this.seq++;
     this.server.emit(WsMessageType.CHAT_STREAM, {
       type: WsMessageType.CHAT_STREAM,
       ts: Date.now(),
+      seq: this.seq,
       data: {
         role: 'dj' as const,
         delta: '',
@@ -179,7 +181,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     index?: number;
     playlist?: any[];
     currentIndex?: number;
-    source?: 'manual' | 'chat' | 'radio_auto';
+    source?: 'manual' | 'chat' | 'radio_auto' | 'bootstrap' | 'restore' | 'dj_chat';
+    queue?: any;
   }) {
     this.broadcast(WsMessageType.PLAYLIST_UPDATE, data);
   }

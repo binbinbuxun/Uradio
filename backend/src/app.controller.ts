@@ -2,7 +2,12 @@
 import { AppService } from './app.service';
 import { MusicService } from './music/music.service';
 import { StateService } from './state/state.service';
-import { PlaybackStateService, PlaybackContent } from './state/playback-state.service';
+import {
+  PlaybackStateService,
+  PlaybackContent,
+  QueueSource,
+  InsertPolicy,
+} from './state/playback-state.service';
 import { ChatGateway } from './chat/chat.gateway';
 import { TasteService } from './user/taste.service';
 import type { Response } from 'express';
@@ -21,10 +26,16 @@ export class AppController {
   private toQueueItem(track: PlaybackContent) {
     return {
       id: track.id,
+      queueItemId: (track as any).queueItemId,
       name: track.title,
+      title: track.title,
       artist: track.artist || '',
       cover: track.coverUrl || '',
       url: track.url || `/audio/${track.id}`,
+      source: (track as any).source,
+      reason: (track as any).reason,
+      status: (track as any).status,
+      insertPolicy: (track as any).insertPolicy,
     };
   }
 
@@ -42,13 +53,7 @@ export class AppController {
   }
 
   private getQueueSnapshot() {
-    const state = this.playbackState.getState();
-    return {
-      playlist: state.playlist.map((track) => this.toQueueItem(track)),
-      currentIndex: state.currentIndex,
-      action: state.action,
-      currentTrackId: state.content?.id || null,
-    };
+    return this.playbackState.getClientQueueSnapshot();
   }
 
   private async ensureQueueInitialized() {
@@ -59,12 +64,7 @@ export class AppController {
 
     const recommendData: any = await this.musicService.getRecommendSongs();
     if (!recommendData || !recommendData.dailySongs || recommendData.dailySongs.length === 0) {
-      return {
-        playlist: [],
-        currentIndex: 0,
-        action: 'pause',
-        currentTrackId: null,
-      };
+      return this.getQueueSnapshot();
     }
 
     const songs = recommendData.dailySongs.slice(0, 30);
@@ -78,8 +78,153 @@ export class AppController {
       coverUrl: song.al.picUrl || '',
       url: `/audio/${song.id}`,
     }));
-    this.playbackState.setPlaylist(tracks);
+    const initialTracks = tracks.slice(0, 12);
+    const reservoir = tracks.slice(12);
+    this.playbackState.initializeQueue(initialTracks, {
+      source: 'bootstrap',
+      label: '今日推荐启动',
+      reservoir,
+    });
     return this.getQueueSnapshot();
+  }
+
+  private async runQueueCommand(payload: {
+    command: 'play_now' | 'play_next' | 'append' | 'remove' | 'clear_upcoming' | 'accept_candidate' | 'reject_candidate' | 'move';
+    track?: any;
+    tracks?: any[];
+    candidateId?: string;
+    index?: number;
+    fromIndex?: number;
+    toIndex?: number;
+    source?: QueueSource | 'chat';
+    reason?: string;
+  }) {
+    await this.ensureQueueInitialized();
+
+    let broadcastAction: 'add' | 'remove' | 'replace' = 'replace';
+    let shouldBroadcastNowPlaying = false;
+
+    switch (payload.command) {
+      case 'play_now':
+      case 'play_next':
+      case 'append': {
+        const incoming = Array.isArray(payload.tracks)
+          ? payload.tracks
+          : payload.track
+            ? [payload.track]
+            : [];
+        if (incoming.length === 0) {
+          return { status: 'error', message: 'Track is required' };
+        }
+
+        const mappedTracks = incoming.map((item) => this.toPlaybackTrack(item));
+        const stateBefore = this.playbackState.getState();
+        const insertAt = payload.command === 'append'
+          ? stateBefore.playlist.length
+          : stateBefore.currentIndex + 1;
+        const source = payload.source === 'chat'
+          ? 'dj_chat'
+          : payload.source || 'manual';
+        const insertPolicy: InsertPolicy = payload.command;
+
+        this.playbackState.addToPlaylist(mappedTracks, insertAt, {
+          source,
+          operator: payload.command === 'append' && source === 'radio_auto' ? 'system' : 'user',
+          insertPolicy,
+          reason: payload.reason,
+        });
+
+        if (payload.command === 'play_now') {
+          this.playbackState.setCurrentIndex(insertAt);
+          this.playbackState.updateState({ action: 'play' });
+          shouldBroadcastNowPlaying = true;
+        }
+
+        broadcastAction = 'add';
+        break;
+      }
+
+      case 'accept_candidate': {
+        if (!payload.candidateId) {
+          return { status: 'error', message: 'candidateId is required' };
+        }
+        const mode = payload.reason as 'play_now' | 'play_next' | 'append' | undefined;
+        const accepted = this.playbackState.acceptCandidate(payload.candidateId, mode || 'append');
+        if (!accepted) {
+          return { status: 'error', message: 'Candidate not found' };
+        }
+        if (mode === 'play_now') {
+          this.playbackState.updateState({ action: 'play' });
+          shouldBroadcastNowPlaying = true;
+        }
+        broadcastAction = 'add';
+        break;
+      }
+
+      case 'reject_candidate': {
+        if (!payload.candidateId) {
+          return { status: 'error', message: 'candidateId is required' };
+        }
+        const removed = this.playbackState.rejectCandidate(payload.candidateId);
+        if (!removed) {
+          return { status: 'error', message: 'Candidate not found' };
+        }
+        broadcastAction = 'replace';
+        break;
+      }
+
+      case 'remove': {
+        if (typeof payload.index !== 'number') {
+          return { status: 'error', message: 'index is required' };
+        }
+        const removed = this.playbackState.removeFromPlaylist(payload.index);
+        if (!removed) {
+          return { status: 'error', message: 'Invalid queue index' };
+        }
+        broadcastAction = 'remove';
+        break;
+      }
+
+      case 'clear_upcoming': {
+        this.playbackState.clearUpcoming();
+        broadcastAction = 'remove';
+        break;
+      }
+
+      case 'move': {
+        if (typeof payload.fromIndex !== 'number' || typeof payload.toIndex !== 'number') {
+          return { status: 'error', message: 'fromIndex and toIndex are required' };
+        }
+        const moved = this.playbackState.moveTrack(payload.fromIndex, payload.toIndex);
+        if (!moved) {
+          return { status: 'error', message: 'Only upcoming tracks can be reordered' };
+        }
+        broadcastAction = 'replace';
+        break;
+      }
+    }
+
+    const queue = this.getQueueSnapshot();
+    this.chatGateway.broadcastPlaylistUpdate({
+      action: broadcastAction,
+      playlist: queue.playlist,
+      currentIndex: queue.currentIndex,
+      source: payload.source === 'chat' ? 'chat' : payload.source || 'manual',
+      queue,
+    });
+
+    if (shouldBroadcastNowPlaying) {
+      const state = this.playbackState.getState();
+      this.chatGateway.broadcastNowPlaying({
+        action: 'play',
+        content: state.content,
+        position: state.position,
+        currentIndex: state.currentIndex,
+        queue,
+      });
+    }
+
+    return { status: 'success', queue };
   }
 
   // ========== 播放状态 ==========
@@ -149,6 +294,62 @@ export class AppController {
     return this.ensureQueueInitialized();
   }
 
+  @Get('api/candidates')
+  async getCandidates() {
+    const queue = await this.ensureQueueInitialized();
+    return queue.candidates;
+  }
+
+  @Post('api/queue/commands')
+  @HttpCode(HttpStatus.OK)
+  async queueCommands(
+    @Body('command') command: 'play_now' | 'play_next' | 'append' | 'remove' | 'clear_upcoming' | 'accept_candidate' | 'reject_candidate' | 'move',
+    @Body('track') track?: any,
+    @Body('tracks') tracks?: any[],
+    @Body('candidateId') candidateId?: string,
+    @Body('index') index?: number,
+    @Body('fromIndex') fromIndex?: number,
+    @Body('toIndex') toIndex?: number,
+    @Body('source') source?: QueueSource | 'chat',
+    @Body('mode') mode?: 'play_now' | 'play_next' | 'append',
+  ) {
+    return this.runQueueCommand({
+      command,
+      track,
+      tracks,
+      candidateId,
+      index,
+      fromIndex,
+      toIndex,
+      source,
+      reason: command === 'accept_candidate' ? mode : undefined,
+    });
+  }
+
+  @Post('api/candidates/:id/accept')
+  @HttpCode(HttpStatus.OK)
+  async acceptCandidate(
+    @Param('id') id: string,
+    @Body('mode') mode?: 'play_now' | 'play_next' | 'append',
+  ) {
+    return this.runQueueCommand({
+      command: 'accept_candidate',
+      candidateId: id,
+      reason: mode,
+      source: 'manual',
+    });
+  }
+
+  @Post('api/candidates/:id/reject')
+  @HttpCode(HttpStatus.OK)
+  async rejectCandidate(@Param('id') id: string) {
+    return this.runQueueCommand({
+      command: 'reject_candidate',
+      candidateId: id,
+      source: 'manual',
+    });
+  }
+
   @Post('api/queue/add')
   @HttpCode(HttpStatus.OK)
   async addQueueTrack(
@@ -158,45 +359,13 @@ export class AppController {
     @Body('playNow') playNow?: boolean,
     @Body('source') source?: 'manual' | 'chat' | 'radio_auto',
   ) {
-    const incoming = Array.isArray(tracks) ? tracks : (track ? [track] : []);
-    if (incoming.length === 0) {
-      return { status: 'error', message: 'Track is required' };
-    }
-
-    const mappedTracks = incoming.map((item) => this.toPlaybackTrack(item));
-    const stateBefore = this.playbackState.getState();
-    const resolvedInsertAt = typeof insertAt === 'number'
-      ? Math.max(0, Math.min(insertAt, stateBefore.playlist.length))
-      : stateBefore.currentIndex + 1;
-
-    this.playbackState.addToPlaylist(mappedTracks, resolvedInsertAt);
-
-    if (playNow) {
-      this.playbackState.setCurrentIndex(resolvedInsertAt);
-      this.playbackState.updateState({ action: 'play' });
-    }
-
-    const queue = this.getQueueSnapshot();
-    this.chatGateway.broadcastPlaylistUpdate({
-      action: 'add',
-      songs: mappedTracks,
-      playlist: queue.playlist,
-      currentIndex: queue.currentIndex,
-      source: source || 'manual',
+    const command = playNow ? 'play_now' : typeof insertAt === 'number' ? 'play_next' : 'append';
+    return this.runQueueCommand({
+      command,
+      track,
+      tracks,
+      source,
     });
-
-    if (playNow) {
-      const state = this.playbackState.getState();
-      this.chatGateway.broadcastNowPlaying({
-        action: 'play',
-        content: state.content,
-        position: state.position,
-        currentIndex: state.currentIndex,
-        queue,
-      });
-    }
-
-    return { status: 'success', queue };
   }
 
   @Post('api/queue/select')
@@ -221,6 +390,25 @@ export class AppController {
     });
 
     return { status: 'success', queue: snapshot };
+  }
+
+  @Post('api/queue/remove')
+  @HttpCode(HttpStatus.OK)
+  async removeQueueTrack(@Body('index') index: number) {
+    return this.runQueueCommand({
+      command: 'remove',
+      index,
+      source: 'manual',
+    });
+  }
+
+  @Post('api/queue/clear-upcoming')
+  @HttpCode(HttpStatus.OK)
+  async clearUpcoming() {
+    return this.runQueueCommand({
+      command: 'clear_upcoming',
+      source: 'manual',
+    });
   }
 
   // ========== 网易云登录 ==========

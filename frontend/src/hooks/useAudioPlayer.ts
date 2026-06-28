@@ -1,5 +1,6 @@
 ﻿import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../api';
+import type { RadioMode } from '../api';
 import { parseLRC } from '../utils';
 
 interface AudioPlayerState {
@@ -14,7 +15,7 @@ interface AudioPlayerState {
   currentSong: any;
   currentLyricIndex: number;
   lyricLines: { time: number; text: string }[];
-  radioMode: boolean;
+  radioMode: RadioMode;
   radioToast: string | null;
   errorToast: string | null;
   audioRef: React.RefObject<HTMLAudioElement | null>;
@@ -34,7 +35,7 @@ interface AudioPlayerState {
   handleSeekStart: () => void;
   handleSeekChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   handleSeekEnd: () => void;
-  setRadioMode: React.Dispatch<React.SetStateAction<boolean>>;
+  setRadioMode: React.Dispatch<React.SetStateAction<RadioMode>>;
   setShowLyrics: React.Dispatch<React.SetStateAction<boolean>>;
   setVolume: React.Dispatch<React.SetStateAction<number>>;
   setErrorToast: React.Dispatch<React.SetStateAction<string | null>>;
@@ -44,7 +45,8 @@ export function useAudioPlayer(
   playlist: any[],
   currentIndex: number,
   setCurrentIndex: (i: number | ((prev: number) => number)) => void,
-  setPlaylist: React.Dispatch<React.SetStateAction<any[]>>,
+  _setPlaylist: React.Dispatch<React.SetStateAction<any[]>>,
+  applyQueueState: (queue?: any) => void,
 ): AudioPlayerState {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -54,9 +56,14 @@ export function useAudioPlayer(
   const [showLyrics, setShowLyrics] = useState(false);
   const [currentLyricIndex, setCurrentLyricIndex] = useState(-1);
   const [lyricLines, setLyricLines] = useState<{ time: number; text: string }[]>([]);
-  const [radioMode, setRadioMode] = useState(() => {
+  const [radioMode, setRadioMode] = useState<RadioMode>(() => {
     const stored = localStorage.getItem('uradio_radio_mode');
-    return stored === null ? true : stored === 'true';
+    if (stored === 'manual' || stored === 'auto') {
+      return stored;
+    }
+    if (stored === 'assist' || stored === 'true') return 'auto';
+    if (stored === 'false') return 'manual';
+    return 'auto';
   });
   const [radioToast, setRadioToast] = useState<string | null>(null);
   const [errorToast, setErrorToast] = useState<string | null>(null);
@@ -71,22 +78,44 @@ export function useAudioPlayer(
   const isFadingRef = useRef(false);
   const audioChainInitRef = useRef(false);
   const openingPlayedRef = useRef(false);
+  const radioModeMountedRef = useRef(false);
 
   const currentSong = playlist.length > 0 ? playlist[currentIndex] : null;
   const toAbsoluteAudioUrl = (url: string) => url.startsWith('http') ? url : 'http://localhost:3000' + url;
-  const applyQueueState = (queue?: { playlist?: any[]; currentIndex?: number }) => {
-    if (!queue) return;
-    if (Array.isArray(queue.playlist)) {
-      setPlaylist(queue.playlist.map((item: any) => ({
-        ...item,
-        id: item.id?.toString?.() || item.id,
-        url: item.url?.startsWith('http') ? item.url : 'http://localhost:3000' + item.url,
-      })));
+  const radioFeedEnabled = radioMode === 'auto';
+  const radioVoiceEnabled = radioMode === 'auto';
+
+  const playTtsWithDucking = useCallback(async (ttsBase64: string) => {
+    const arr = new Uint8Array(
+      atob(ttsBase64).split('').map((char) => char.charCodeAt(0)),
+    );
+    const blob = new Blob([arr], { type: 'audio/mpeg' });
+    const url = URL.createObjectURL(blob);
+    const ttsAudio = new Audio(url);
+    const gainNode = gainNodeRef.current;
+    const previousGain = gainNode?.gain.value;
+
+    if (gainNode && typeof previousGain === 'number') {
+      gainNode.gain.value = previousGain * 0.2;
     }
-    if (typeof queue.currentIndex === 'number') {
-      setCurrentIndex(queue.currentIndex);
-    }
-  };
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        if (gainNode && typeof previousGain === 'number') {
+          gainNode.gain.value = previousGain;
+        }
+        URL.revokeObjectURL(url);
+        resolve();
+      };
+
+      ttsAudio.onended = cleanup;
+      ttsAudio.onerror = cleanup;
+      ttsAudio.play().catch(cleanup);
+    });
+  }, []);
 
   // AudioContext init
   useEffect(() => {
@@ -186,7 +215,7 @@ export function useAudioPlayer(
 
     navigator.mediaSession.setActionHandler('play', () => setIsPlaying(true));
     navigator.mediaSession.setActionHandler('pause', () => setIsPlaying(false));
-    navigator.mediaSession.setActionHandler('previoustrack', () => onCrossfadeNext.current());
+    navigator.mediaSession.setActionHandler('previoustrack', () => onCrossfadePrev.current());
     navigator.mediaSession.setActionHandler('nexttrack', () => onCrossfadeNext.current());
   }, [currentSong?.id]);
 
@@ -198,8 +227,15 @@ export function useAudioPlayer(
 
   // Persist radio mode
   useEffect(() => {
-    localStorage.setItem('uradio_radio_mode', String(radioMode));
-    setRadioToast(radioMode ? '电台模式' : '播放模式');
+    localStorage.setItem('uradio_radio_mode', radioMode);
+    if (!radioModeMountedRef.current) {
+      radioModeMountedRef.current = true;
+      return;
+    }
+    const modeLabel = radioMode === 'manual'
+      ? 'MANUAL QUEUE'
+      : 'AUTO RADIO';
+    setRadioToast(modeLabel);
     const t = setTimeout(() => setRadioToast(null), 2000);
     return () => clearTimeout(t);
   }, [radioMode]);
@@ -228,13 +264,17 @@ export function useAudioPlayer(
     const nextIndex = (currentIndex + 1) % playlist.length;
     setCurrentIndex(nextIndex);
     setIsPlaying(true);
-    api.selectQueueTrack(nextIndex).catch(console.error);
-  }, [playlist.length, currentIndex, setCurrentIndex]);
+    api.selectQueueTrack(nextIndex)
+      .then((result) => {
+        if (result.queue) applyQueueState(result.queue);
+      })
+      .catch(console.error);
+  }, [playlist.length, currentIndex, setCurrentIndex, applyQueueState]);
 
   const handleSongEnd = useCallback(async () => {
     if (playlist.length === 0) return;
 
-    if (radioMode) {
+    if (radioVoiceEnabled) {
       try {
         let segue = await api.getSegueNext();
         if ((!segue?.ttsBase64 || !segue.text) && currentSong?.id) {
@@ -242,47 +282,11 @@ export function useAudioPlayer(
           segue = await api.getSegueNext();
         }
         if (segue?.ttsBase64 && segue.text) {
-          const arr = new Uint8Array(
-            atob(segue.ttsBase64).split('').map(c => c.charCodeAt(0)),
-          );
-          const blob = new Blob([arr], { type: 'audio/mpeg' });
-          const url = URL.createObjectURL(blob);
-          const ttsAudio = new Audio(url);
-
-          const gainNode = gainNodeRef.current;
-          const prevGain = gainNode?.gain.value ?? 0.3;
-          if (gainNode) gainNode.gain.value = prevGain * 0.2;
-
-          await new Promise<void>((resolve) => {
-            ttsAudio.onended = () => {
-              if (gainNode) gainNode.gain.value = prevGain;
-              URL.revokeObjectURL(url);
-              resolve();
-            };
-            ttsAudio.onerror = () => {
-              if (gainNode) gainNode.gain.value = prevGain;
-              URL.revokeObjectURL(url);
-              resolve();
-            };
-            ttsAudio.play().catch(() => resolve());
-          });
+          await playTtsWithDucking(segue.ttsBase64);
 
           if (segue.type === 'recommendation' && segue.recommendedSongs?.length) {
-            const newTracks = segue.recommendedSongs.map((s: any) => ({
-              id: s.id,
-              name: s.name,
-              artist: s.artist,
-              cover: s.cover,
-              url: '/audio/' + s.id,
-            }));
-            const result = await api.addQueueTrack({
-              tracks: newTracks,
-              insertAt: currentIndex + 1,
-              source: 'radio_auto',
-            });
-            if (result.queue) {
-              applyQueueState(result.queue);
-            }
+            const queue = await api.getQueue();
+            applyQueueState(queue);
           }
         }
       } catch {
@@ -293,16 +297,24 @@ export function useAudioPlayer(
     const nextIndex = (currentIndex + 1) % playlist.length;
     setCurrentIndex(nextIndex);
     setIsPlaying(true);
-    api.selectQueueTrack(nextIndex).catch(console.error);
-  }, [playlist.length, currentIndex, radioMode, setCurrentIndex, setPlaylist]);
+    api.selectQueueTrack(nextIndex)
+      .then((result) => {
+        if (result.queue) applyQueueState(result.queue);
+      })
+      .catch(console.error);
+  }, [playlist.length, currentIndex, radioVoiceEnabled, setCurrentIndex, applyQueueState, currentSong?.id, volume, playTtsWithDucking]);
 
   const prevTrack = useCallback(() => {
     if (playlist.length === 0) return;
     const nextIndex = (currentIndex - 1 + playlist.length) % playlist.length;
     setCurrentIndex(nextIndex);
     setIsPlaying(true);
-    api.selectQueueTrack(nextIndex).catch(console.error);
-  }, [playlist.length, currentIndex, setCurrentIndex]);
+    api.selectQueueTrack(nextIndex)
+      .then((result) => {
+        if (result.queue) applyQueueState(result.queue);
+      })
+      .catch(console.error);
+  }, [playlist.length, currentIndex, setCurrentIndex, applyQueueState]);
 
   // Crossfade
   const crossfadeNext = useCallback(() => {
@@ -400,7 +412,7 @@ export function useAudioPlayer(
       audioContextRef.current.resume();
     }
 
-    if (!isPlaying && radioMode && !openingPlayedRef.current && currentSong) {
+    if (!isPlaying && radioVoiceEnabled && !openingPlayedRef.current && currentSong) {
       console.log('[Opening] Fetching opening TTS... volume=', volume);
       api.getOpening(volume).then((opening) => {
         console.log('[Opening] API response:', opening);
@@ -513,7 +525,7 @@ export function useAudioPlayer(
     updatePositionState();
 
     const remaining = (audio.duration || 0) - audio.currentTime;
-    if (remaining <= 10 && remaining > 0 && !prefetchedRef.current && currentSong?.id) {
+    if (remaining <= 10 && remaining > 0 && !prefetchedRef.current && currentSong?.id && radioFeedEnabled) {
       prefetchedRef.current = true;
       api.prefetchNext(currentSong.id, volume).then((data) => {
         const urls = [data?.next?.url, ...(data?.upcoming || []).map((u: any) => u.url)].filter(Boolean);

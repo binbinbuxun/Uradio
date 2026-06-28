@@ -9,7 +9,7 @@ import { PlayHistoryService } from './play-history.service';
 import { TraceService, ActiveTrace } from './trace.service';
 import { ExecutionTrace } from './execution-trace.entity';
 import { LlmService } from '../llm/llm.service';
-import { PlaybackStateService } from '../state/playback-state.service';
+import { PlaybackStateService, PlaybackContent } from '../state/playback-state.service';
 import { MusicService } from '../music/music.service';
 import { TtsService } from '../tts/tts.service';
 import { SchedulerService } from '../scheduler/scheduler.service';
@@ -309,7 +309,12 @@ export class ChatController {
               if (newTracks.length === 0) {
                 throw new Error('No matching songs found');
               }
-              this.playbackState.addToPlaylist(newTracks);
+              this.playbackState.addToPlaylist(newTracks, undefined, {
+                source: 'manual',
+                operator: 'user',
+                insertPolicy: 'append',
+                reason: '用户要求直接加歌',
+              });
               recommendedSongs = newTracks;
               // 记录入队歌曲
               for (const track of newTracks) {
@@ -327,7 +332,10 @@ export class ChatController {
               this.chatGateway.broadcastPlaylistUpdate({
                 action: 'add',
                 songs: newTracks,
-                playlist: this.playbackState.getPlaylist(),
+                playlist: this.playbackState.getClientQueueSnapshot().playlist,
+                currentIndex: this.playbackState.getState().currentIndex,
+                source: 'manual',
+                queue: this.playbackState.getClientQueueSnapshot(),
               });
               const songList = newTracks.map((t: any) => `《${t.name}》-${t.artist}`).join('、');
               actionContext = `[系统动作: 已搜索“${intent.params.keyword}”并加入播放列表: ${songList}]`;
@@ -374,7 +382,10 @@ export class ChatController {
             this.chatGateway.broadcastPlaylistUpdate({
               action: 'remove',
               index: removeIndex,
-              playlist: this.playbackState.getPlaylist(),
+              playlist: this.playbackState.getClientQueueSnapshot().playlist,
+              currentIndex: this.playbackState.getState().currentIndex,
+              source: 'manual',
+              queue: this.playbackState.getClientQueueSnapshot(),
             });
             const target = intent.params?.songName || `第${intent.params?.index}首`;
             actionContext = `[系统动作: 已从播放列表移除${target}]`;
@@ -650,6 +661,37 @@ export class ChatController {
             } catch {
               trace.addStep('artist_fallback_search', Date.now() - searchStart, undefined, 'error', 'Artist search failed');
             }
+          }
+        }
+
+        if (recommendedSongs.length > 0 && intent.type !== 'add_song') {
+          const chatCandidates = this.playbackState.addCandidates(
+            'chat',
+            recommendedSongs.map((song) => this.toPlaybackTrackFromCard(song)),
+            { reason: structured.reason || 'DJ 推荐' },
+          );
+
+          if (chatCandidates.length > 0) {
+            const candidateMap = new Map(chatCandidates.map((candidate) => [candidate.track.id, candidate]));
+            recommendedSongs = recommendedSongs.map((song) => {
+              const candidate = candidateMap.get(song.id);
+              return candidate
+                ? {
+                  ...song,
+                  candidateId: candidate.candidateId,
+                  source: candidate.source,
+                  reason: candidate.reason,
+                }
+                : song;
+            });
+
+            this.chatGateway.broadcastPlaylistUpdate({
+              action: 'replace',
+              playlist: this.playbackState.getClientQueueSnapshot().playlist,
+              currentIndex: this.playbackState.getState().currentIndex,
+              source: 'chat',
+              queue: this.playbackState.getClientQueueSnapshot(),
+            });
           }
         }
 
@@ -1121,6 +1163,25 @@ export class ChatController {
       coverUrl: song.al?.picUrl || '',
       cover: song.al?.picUrl || '',
       url: `/audio/${song.id}`,
+    };
+  }
+
+  private toPlaybackTrackFromCard(song: {
+    id: string;
+    name: string;
+    artist: string;
+    cover?: string;
+    url?: string;
+  }): PlaybackContent {
+    return {
+      type: 'song',
+      id: song.id.toString(),
+      title: song.name,
+      artist: song.artist || '',
+      album: '',
+      duration: 0,
+      coverUrl: song.cover || '',
+      url: song.url || `/audio/${song.id}`,
     };
   }
 

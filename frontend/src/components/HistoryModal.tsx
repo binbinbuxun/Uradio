@@ -1,110 +1,176 @@
-﻿import React, { useState, useEffect } from 'react';
-import { X, MessageSquare, Trash2 } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Disc3, MessageSquare, Play, Trash2, X } from 'lucide-react';
 import { api } from '../api';
-import type { ChatSession } from '../api';
+import type { ChatSession, PlayHistoryItem, QueueInsertMode } from '../api';
 
 interface HistoryModalProps {
   isOpen: boolean;
   onClose: () => void;
   onLoadSession: (sessionId: number) => void;
+  onReplayTrack: (track: any, mode?: QueueInsertMode) => void;
   currentSessionId: number | null;
 }
 
-const HistoryModal: React.FC<HistoryModalProps> = ({ isOpen, onClose, onLoadSession, currentSessionId }) => {
+const HistoryModal: React.FC<HistoryModalProps> = ({
+  isOpen,
+  onClose,
+  onLoadSession,
+  onReplayTrack,
+  currentSessionId,
+}) => {
+  const [tab, setTab] = useState<'chat' | 'play'>('play');
   const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [playHistory, setPlayHistory] = useState<PlayHistoryItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [_deletingId, setDeletingId] = useState<number | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
+    setTab('play');
     setLoading(true);
-    api.getSessions().then((result) => {
-      if (result.status === 'success') {
-        setSessions(result.sessions);
-      }
-      setLoading(false);
-    }).catch(() => setLoading(false));
+    Promise.all([api.getSessions(), api.getPlayHistory(60, 168)])
+      .then(([sessionResult, plays]) => {
+        if (sessionResult.status === 'success') {
+          setSessions(sessionResult.sessions);
+        }
+        setPlayHistory(plays);
+      })
+      .finally(() => setLoading(false));
   }, [isOpen]);
 
   if (!isOpen) return null;
 
-  const handleDelete = async (e: React.MouseEvent, sessionId: number) => {
-    e.stopPropagation();
+  const handleDelete = async (event: React.MouseEvent, sessionId: number) => {
+    event.stopPropagation();
     if (!window.confirm('确定删除这个对话？')) return;
     setDeletingId(sessionId);
     await api.deleteSession(sessionId);
-    setSessions(prev => prev.filter(s => s.id !== sessionId));
+    setSessions((prev) => prev.filter((session) => session.id !== sessionId));
     setDeletingId(null);
   };
 
   const formatDate = (dateStr: string) => {
-    const d = new Date(dateStr);
+    const date = new Date(dateStr);
     const now = new Date();
-    const isToday = d.toDateString() === now.toDateString();
     const yesterday = new Date(now);
     yesterday.setDate(yesterday.getDate() - 1);
-    const isYesterday = d.toDateString() === yesterday.toDateString();
 
-    if (isToday) return '今天';
-    if (isYesterday) return '昨天';
-    return `${d.getMonth() + 1}月${d.getDate()}日`;
+    if (date.toDateString() === now.toDateString()) return '今天';
+    if (date.toDateString() === yesterday.toDateString()) return '昨天';
+    return `${date.getMonth() + 1}月${date.getDate()}日`;
   };
 
   const formatTime = (dateStr: string) => {
-    const d = new Date(dateStr);
-    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    const date = new Date(dateStr);
+    return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+  };
+
+  const triggerLabel: Record<string, string> = {
+    user_request: '用户点播',
+    auto_next: '自动切换',
+    recommendation: '电台推荐',
+    search: '搜索结果',
+    chat_play: 'DJ 推荐',
+    manual: '手动播放',
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={onClose}>
       <div
-        className="bg-black border border-border-visible rounded-2xl w-full max-w-[400px] max-h-[70vh] flex flex-col shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-[480px] max-h-[75vh] overflow-hidden rounded-2xl border border-border-visible bg-black"
+        onClick={(event) => event.stopPropagation()}
       >
-        {/* Header */}
-        <div className="px-lg py-md flex justify-between items-center border-b border-border-visible flex-shrink-0">
-          <span className="text-body text-text-primary font-medium">历史对话</span>
-          <button onClick={onClose} className="text-text-disabled hover:text-text-secondary transition-colors cursor-pointer">
+        <div className="nd-panel-header border-b-0">
+          <span className="text-subheading text-text-display">历史记录</span>
+          <button onClick={onClose} className="text-text-disabled transition-colors hover:text-text-display" title="关闭">
             <X size={16} />
           </button>
         </div>
 
-        {/* Session list */}
-        <div className="flex-1 overflow-y-auto px-md py-sm queue-scrollbar">
+        <div className="px-md pb-sm">
+          <div className="nd-segmented">
+            <button
+              onClick={() => setTab('play')}
+              className={`nd-segment ${tab === 'play' ? 'nd-segment-active' : ''}`}
+            >
+              PLAY HISTORY
+            </button>
+            <button
+              onClick={() => setTab('chat')}
+              className={`nd-segment ${tab === 'chat' ? 'nd-segment-active' : ''}`}
+            >
+              CHAT SESSIONS
+            </button>
+          </div>
+        </div>
+
+        <div className="queue-scrollbar flex max-h-[56vh] flex-col gap-2 overflow-y-auto px-md pb-md">
           {loading && (
-            <div className="text-text-disabled text-center py-lg text-label">Loading...</div>
+            <div className="py-lg text-center text-label text-text-disabled">LOADING...</div>
           )}
-          {!loading && sessions.length === 0 && (
-            <div className="text-text-disabled text-center py-lg text-label">暂无对话记录</div>
+
+          {!loading && tab === 'chat' && sessions.length === 0 && (
+            <div className="py-lg text-center text-label text-text-disabled">暂无对话记录</div>
           )}
-          {!loading && sessions.map((session) => (
+
+          {!loading && tab === 'chat' && sessions.map((session) => (
             <div
               key={session.id}
               onClick={() => onLoadSession(session.id)}
-              className={`flex items-center gap-md px-md py-sm rounded-lg cursor-pointer transition-colors group ${
-                session.id === currentSessionId
-                  ? 'bg-interactive/10 border border-interactive/30'
-                  : 'hover:bg-surface-secondary border border-transparent'
-              }`}
+              className={`nd-track-card cursor-pointer ${session.id === currentSessionId ? 'border-text-display' : ''}`}
             >
-              <div className="flex-shrink-0 text-text-disabled group-hover:text-text-secondary transition-colors">
+              <div className="text-text-disabled">
                 <MessageSquare size={18} />
               </div>
-              <div className="flex-1 min-w-0">
-                <div className="text-text-primary text-sm truncate">
-                  {session.title || '新对话'}
-                </div>
-                <div className="text-text-disabled text-[10px] mt-0.5">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-body-sm text-text-primary">{session.title || '新对话'}</div>
+                <div className="mt-1 text-caption text-text-secondary">
                   {formatDate(session.updatedAt)} {formatTime(session.updatedAt)}
-                  {session.messageCount > 0 && ` · ${session.messageCount} 条消息`}
+                  {session.messageCount > 0 ? ` · ${session.messageCount} 条消息` : ''}
                 </div>
               </div>
               <button
-                onClick={(e) => handleDelete(e, session.id)}
-                className="text-text-disabled hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100 p-xs cursor-pointer"
+                onClick={(event) => handleDelete(event, session.id)}
+                className="text-text-disabled transition-colors hover:text-error"
                 title="删除对话"
               >
                 <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+
+          {!loading && tab === 'play' && playHistory.length === 0 && (
+            <div className="py-lg text-center text-label text-text-disabled">暂无播放历史</div>
+          )}
+
+          {!loading && tab === 'play' && playHistory.map((item) => (
+            <div key={item.id} className="nd-track-card">
+              <div className="flex-shrink-0 text-text-disabled">
+                {item.coverUrl ? (
+                  <img src={item.coverUrl} alt="" className="h-10 w-10 rounded-[10px] object-cover" />
+                ) : (
+                  <Disc3 size={18} />
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-body-sm text-text-primary">{item.title}</div>
+                <div className="truncate text-caption text-text-secondary">{item.artist || '未知歌手'}</div>
+                <div className="mt-1 text-caption text-text-disabled">
+                  {formatDate(item.playedAt)} {formatTime(item.playedAt)} · {triggerLabel[item.trigger] || item.trigger}
+                </div>
+              </div>
+              <button
+                onClick={() => onReplayTrack({
+                  id: item.songId,
+                  name: item.title,
+                  artist: item.artist,
+                  cover: item.coverUrl,
+                  url: `/audio/${item.songId}`,
+                }, 'play_now')}
+                className="nd-icon-button"
+                title="重新播放"
+              >
+                <Play size={14} />
               </button>
             </div>
           ))}
@@ -115,6 +181,3 @@ const HistoryModal: React.FC<HistoryModalProps> = ({ isOpen, onClose, onLoadSess
 };
 
 export default HistoryModal;
-
-
-

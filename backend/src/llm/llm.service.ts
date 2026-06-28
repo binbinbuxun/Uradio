@@ -16,12 +16,16 @@ export class LlmService {
   private readonly apiKey: string;
   private readonly apiUrl: string;
   private readonly personaPath: string;
+  private readonly primaryModel: string;
+  private readonly lightModel: string;
 
   constructor(private readonly config: ConfigService) {
     this.apiKey = this.config.get<string>('LLM_API_KEY') || '';
     this.apiUrl = this.config.get<string>('LLM_API_URL') || 'https://api.deepseek.com/v1/chat/completions';
     this.personaPath = this.config.get<string>('DJ_PERSONA_PATH')
       || join(process.cwd(), '..', 'user-data', 'dj-persona.md');
+    this.primaryModel = this.config.get<string>('LLM_MODEL') || 'deepseek-chat';
+    this.lightModel = this.resolveLightModel();
   }
 
   // persona 文件按优先级加载，超预算时从低优先级截断/跳过
@@ -36,6 +40,18 @@ keyword 是用于音乐搜索引擎的精确搜索词，必须符合以下规则
 - **只推荐原唱/官方版本，绝不推荐翻唱**，keyword 必须包含原唱歌手名以确保匹配原唱
 - 正确示例：✅ "稻香 周杰伦" ✅ "Miles Davis" ✅ "菊次郎的夏天 久石让" ✅ "好久不见 陈奕迅"
 - 错误示例：❌ "一些轻松的爵士乐" ❌ "适合下雨听的歌" ❌ "安静的钢琴曲" ❌ "稻香 翻唱"`;
+
+  private resolveLightModel(): string {
+    const configured = this.config.get<string>('LLM_LIGHT_MODEL')?.trim();
+    if (configured) return configured;
+
+    const primary = this.config.get<string>('LLM_MODEL') || 'deepseek-chat';
+    if (/reasoner|thinking|deepseek-v4-flash/i.test(primary)) {
+      this.logger.log(`LLM light model fallback: ${primary} -> deepseek-chat`);
+      return 'deepseek-chat';
+    }
+    return primary;
+  }
 
   // P1-1: Function Calling 工具定义（OpenAI 兼容格式）
   private readonly DJ_REPLY_TOOL = {
@@ -93,9 +109,35 @@ keyword 是用于音乐搜索引擎的精确搜索词，必须符合以下规则
    */
   private sanitizeSay(say: string): string {
     if (!say) return say;
-    return say
+    const cleaned = say
       .replace(/\s*\[[^:\]]+:[^\]]*\]\s*/g, '')
+      .replace(/\s+/g, ' ')
       .trim();
+
+    return this.dedupeRepeatedSentences(cleaned);
+  }
+
+  private dedupeRepeatedSentences(text: string): string {
+    const segments = text
+      .split(/(?<=[。！？!?；;])/)
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+
+    if (segments.length <= 1) {
+      return text.trim();
+    }
+
+    const deduped: string[] = [];
+    for (const segment of segments) {
+      const normalized = segment.replace(/\s+/g, '');
+      const prev = deduped[deduped.length - 1];
+      if (prev && prev.replace(/\s+/g, '') === normalized) {
+        continue;
+      }
+      deduped.push(segment);
+    }
+
+    return deduped.join(' ').trim();
   }
 
   private finalizeSegueText(text: string, nextTitle: string, nextArtist: string): string {
@@ -296,12 +338,12 @@ keyword 是用于音乐搜索引擎的精确搜索词，必须符合以下规则
           'Authorization': `Bearer ${this.apiKey}`,
         },
         body: JSON.stringify({
-          model: this.config.get<string>('LLM_MODEL') || 'deepseek-chat',
+          model: this.lightModel,
           messages: [
             { role: 'system', content: systemContent },
             { role: 'user', content: userContent },
           ],
-          max_tokens: 60,
+          max_tokens: 120,
           temperature: 0.8,
         }),
       });
@@ -420,20 +462,28 @@ keyword 是用于音乐搜索引擎的精确搜索词，必须符合以下规则
           'Authorization': `Bearer ${this.apiKey}`,
         },
         body: JSON.stringify({
-          model: this.config.get<string>('LLM_MODEL') || 'deepseek-chat',
+          model: this.lightModel,
           messages: [
             { role: 'system', content: systemContent },
             { role: 'user', content: userContent },
           ],
-          max_tokens: 80,
+          max_tokens: 180,
           temperature: 0.8,
         }),
       });
 
-      if (!response.ok) return null;
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        this.logger.error(`LLM opening API error: ${response.status}, body: ${body.slice(0, 300)}`);
+        return null;
+      }
       const data = await response.json();
       const text = data.choices?.[0]?.message?.content?.trim();
-      return text ? { say: this.sanitizeSay(text) } : null;
+      if (!text) {
+        this.logger.warn(`LLM opening returned empty content: ${JSON.stringify(data).slice(0, 300)}`);
+        return null;
+      }
+      return { say: this.sanitizeSay(text) };
     } catch (error) {
       this.logger.error(`LLM opening request failed: ${error}`);
       return null;
@@ -473,12 +523,12 @@ ${recentList}
           'Authorization': `Bearer ${this.apiKey}`,
         },
         body: JSON.stringify({
-          model: this.config.get<string>('LLM_MODEL') || 'deepseek-chat',
+          model: this.lightModel,
           messages: [
             { role: 'system', content: systemContent },
             { role: 'user', content: userContent },
           ],
-          max_tokens: 400,
+          max_tokens: 480,
           temperature: 0.8,
         }),
       });

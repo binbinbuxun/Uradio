@@ -1,10 +1,12 @@
-import { Controller, Get, Post, Body, Res, Query, BadRequestException } from '@nestjs/common';
+import { Controller, Get, Post, Body, Res, Query, BadRequestException, Logger } from '@nestjs/common';
 import { TtsService, TtsOptions } from './tts.service';
 import { PrefetchService } from './prefetch.service';
 import type { Response } from 'express';
 
 @Controller('api')
 export class TtsController {
+  private readonly logger = new Logger(TtsController.name);
+
   constructor(
     private readonly ttsService: TtsService,
     private readonly prefetchService: PrefetchService,
@@ -120,8 +122,13 @@ export class TtsController {
   @Get('tts/opening')
   async getOpening(@Query('volume') volume?: string) {
     const clientVolume = volume ? parseFloat(volume) : 0.5;
+    this.logger.log(`Opening request received, volume=${clientVolume}`);
     const opening = await this.prefetchService.generateOpening(clientVolume);
-    if (!opening) return { text: null, ttsBase64: null };
+    if (!opening) {
+      this.logger.warn('Opening generation returned null');
+      return { text: null, ttsBase64: null };
+    }
+    this.logger.log(`Opening generated: "${opening.text.slice(0, 40)}"`);
     return {
       text: opening.text,
       ttsBase64: opening.ttsBase64,

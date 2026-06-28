@@ -1,4 +1,4 @@
-import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
+ï»¿import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { TtsService } from './tts.service';
@@ -6,7 +6,7 @@ import { MusicService } from '../music/music.service';
 import { ChatMessage } from '../chat/chat-message.entity';
 import { ChatGateway } from '../chat/chat.gateway';
 import { SegueEngineService } from './segue-engine.service';
-import { PlaybackContent } from '../state/playback-state.service';
+import { PlaybackContent, PlaybackStateService } from '../state/playback-state.service';
 import { LlmService } from '../llm/llm.service';
 
 export interface PrefetchResult {
@@ -66,6 +66,7 @@ export class PrefetchService {
     private readonly musicService: MusicService,
     private readonly llmService: LlmService,
     private readonly segueEngine: SegueEngineService,
+    private readonly playbackState: PlaybackStateService,
     @InjectRepository(ChatMessage)
     private readonly chatMessageRepo: Repository<ChatMessage>,
     @Inject(forwardRef(() => ChatGateway))
@@ -82,10 +83,28 @@ export class PrefetchService {
     return {
       songId: track.id.toString(),
       title: track.title,
-      artist: track.artist || 'Î´Öª¸èÊÖ',
+      artist: track.artist || 'æœªçŸ¥æ­Œæ‰‹',
       url: track.url || `/audio/${track.id}`,
       duration: track.duration || 0,
     };
+  }
+
+  private broadcastQueueUpdate(action: 'add' | 'replace' = 'replace') {
+    const queue = this.playbackState.getClientQueueSnapshot();
+    this.chatGateway.broadcastPlaylistUpdate({
+      action,
+      playlist: queue.playlist,
+      currentIndex: queue.currentIndex,
+      source: 'radio_auto',
+      queue,
+    });
+  }
+
+  private ensureAutoUpcoming(minUpcoming = 3) {
+    const appended = this.playbackState.ensureBootstrapUpcoming(minUpcoming, 4);
+    if (appended.length > 0) {
+      this.broadcastQueueUpdate('add');
+    }
   }
 
   async generateOpening(clientVolume = 0.5): Promise<CachedSegue | null> {
@@ -95,11 +114,15 @@ export class PrefetchService {
 
     try {
       const result = await this.llmService.generateOpening(slotContext);
-      if (!result?.say) return null;
+      if (!result?.say) {
+        this.logger.warn(`Opening generation returned empty result, slotContext=${slotContext || 'empty'}`);
+        return null;
+      }
+      const openingText = result.say;
 
-      const ttsBase64 = await this.synthesizeBase64(result.say, clientVolume);
+      const ttsBase64 = await this.synthesizeBase64(openingText, clientVolume);
       const opening: CachedSegue = {
-        text: result.say,
+        text: openingText,
         ttsBase64,
         songTitle: '',
         artist: '',
@@ -107,12 +130,12 @@ export class PrefetchService {
         type: 'opening',
       };
 
-      this.saveSegueToChatHistory(result.say, 'opening').catch(
+      this.saveSegueToChatHistory(openingText, 'opening').catch(
         (e) => this.logger.warn(`Failed to save opening to chat history: ${e}`),
       );
       this.chatGateway.broadcastSegue({
         type: 'opening',
-        text: result.say,
+        text: openingText,
         source: 'radio_auto',
       });
 
@@ -125,6 +148,7 @@ export class PrefetchService {
 
   async prefetchNext(currentSongId: string, clientVolume = 0.5): Promise<PrefetchResult> {
     this.logger.log(`Prefetching next song after ${currentSongId} (playCount=${this.playCount}, recAt=${this.nextRecommendationAt})`);
+    this.ensureAutoUpcoming(3);
 
     const trackWindow = this.segueEngine.resolveTrackWindow(currentSongId, 3);
     if (!trackWindow?.next) {
@@ -236,6 +260,27 @@ export class PrefetchService {
         }
       }
 
+      const existingTrackIds = new Set(this.playbackState.getPlaylist().map((track) => track.id));
+      const autoAppendTracks = recommendedSongs
+        .filter((song) => song?.id && !existingTrackIds.has(song.id))
+        .map((song) => ({
+          type: 'song' as const,
+          id: song.id,
+          title: song.name,
+          artist: song.artist || '',
+          coverUrl: song.cover || '',
+          duration: 0,
+          url: `/audio/${song.id}`,
+        }));
+      if (autoAppendTracks.length > 0) {
+        this.playbackState.addToPlaylist(autoAppendTracks, undefined, {
+          source: 'radio_auto',
+          operator: 'system',
+          insertPolicy: 'append',
+        });
+        this.broadcastQueueUpdate('add');
+      }
+
       const ttsBase64 = await this.synthesizeBase64(rec.say, clientVolume);
       this.pendingSegue = {
         text: rec.say,
@@ -307,6 +352,7 @@ export class PrefetchService {
     this.logger.debug(`Saved ${segueType} to chat history: "${text.substring(0, 30)}..."`);
   }
 }
+
 
 
 
